@@ -1,0 +1,408 @@
+#!/usr/bin/env node
+'use strict';
+// bx — the terminal face of the bridge. Auto-starts the bridge on first use,
+// so an agent never has to think about lifecycle.
+const http = require('http');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const ROOT = path.resolve(__dirname, '..');
+const HOME = process.env.BX_HOME || path.join(os.homedir(), '.bx');
+const CFG_PATH = path.join(HOME, 'config.json');
+
+// ── presentation ─────────────────────────────────────────────────────────
+const TTY = process.stdout.isTTY && !process.env.NO_COLOR;
+const c = (n) => (s) => (TTY ? `\x1b[${n}m${s}\x1b[0m` : String(s));
+const dim = c('2'), bold = c('1'), red = c('31'), grn = c('32'), yel = c('33'), blu = c('36'), mag = c('35');
+const OK = TTY ? grn('✓') : 'ok', BAD = TTY ? red('✗') : 'ERR', DOT = dim('·');
+
+const trunc = (s, n) => { s = String(s ?? '').replace(/\s+/g, ' '); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+const ms = (n) => dim(String(n).padStart(5) + 'ms');
+
+function die(msg, code = 1) { console.error(`${BAD} ${msg}`); process.exit(code); }
+
+// ── config / transport ───────────────────────────────────────────────────
+function config() {
+  try { return JSON.parse(fs.readFileSync(CFG_PATH, 'utf8')); }
+  catch { return { port: 8787, token: null }; }
+}
+
+function req(method, route, body, port, token) {
+  return new Promise((resolve, reject) => {
+    const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
+    const r = http.request({
+      host: '127.0.0.1', port, path: route, method,
+      headers: Object.assign(
+        { 'x-bx-token': token || '' },
+        data ? { 'content-type': 'application/json', 'content-length': data.length } : {}
+      )
+    }, (res) => {
+      let b = '';
+      res.on('data', (x) => (b += x));
+      res.on('end', () => { try { resolve({ code: res.statusCode, body: JSON.parse(b || '{}') }); } catch { resolve({ code: res.statusCode, body: { raw: b } }); } });
+    });
+    r.on('error', reject);
+    r.setTimeout(180000, () => { r.destroy(new Error('request timeout')); });
+    if (data) r.write(data);
+    r.end();
+  });
+}
+
+const alive = async (port) => { try { const r = await req('GET', '/health', undefined, port, ''); return r.body.up === true; } catch { return false; } };
+
+async function ensureBridge(quiet) {
+  const cfg = config();
+  if (await alive(cfg.port)) return config();
+  if (!quiet) process.stderr.write(dim('starting bridge…\n'));
+  const child = spawn(process.execPath, [path.join(ROOT, 'bridge', 'server.js')], {
+    detached: true, stdio: 'ignore', env: { ...process.env, BX_QUIET: '1' }
+  });
+  child.unref();
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 60));
+    const c2 = config();
+    if (await alive(c2.port)) return c2;
+  }
+  die('bridge failed to start');
+}
+
+async function api(method, route, body) {
+  const cfg = await ensureBridge(true);
+  const r = await req(method, route, body, cfg.port, cfg.token);
+  if (r.code === 401) die('bad token — delete ~/.bx/config.json and retry');
+  return r.body;
+}
+
+// ── arg parsing ──────────────────────────────────────────────────────────
+const argv = process.argv.slice(2);
+const flags = {};
+const args = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a.startsWith('--')) {
+    const [k, v] = a.slice(2).split('=');
+    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note'].includes(k) ? argv[++i] : true) : v;
+  } else args.push(a);
+}
+const num = (v) => (v === undefined ? undefined : Number(v));
+
+const common = () => ({
+  tab: flags.tab === undefined ? 'active' : /^\d+$/.test(flags.tab) ? Number(flags.tab) : flags.tab,
+  speed: flags.speed,
+  trusted: flags.trusted ? true : undefined,
+  timeout: num(flags.timeout),
+  inline: flags.inline ? true : undefined,
+  stopOnError: flags.keepgoing ? false : undefined
+});
+
+// ── rendering ────────────────────────────────────────────────────────────
+function render(out) {
+  if (flags.json) { console.log(JSON.stringify(out, null, 2)); return out.ok ? 0 : 1; }
+  if (out.error && !out.results) { console.error(`${BAD} ${out.error}`); return 1; }
+
+  for (const r of out.results || []) {
+    const head = `${r.ok ? OK : BAD} ${bold(r.a.padEnd(9))} ${ms(r.ms)}`;
+    if (!r.ok) { console.log(`${head}  ${red(trunc(r.error, 140))}`); continue; }
+    console.log(`${head}  ${summary(r.a, r.r)}${amb(r.r)}`);
+    detail(r.a, r.r);
+  }
+  if ((out.results || []).length > 1) console.log(dim(`${DOT} ${out.results.length} actions in ${out.ms}ms  tab ${out.tab}`));
+  if (out.memory) recall(out.memory);
+  return out.ok ? 0 : 1;
+}
+
+// What bx already knows about this site. It arrives unasked on arrival and on
+// failure — the two moments an agent is about to rediscover it the slow way.
+function recall(m, wide) {
+  const row = (k, v, colour = dim) => console.log(`    ${mag(k.padEnd(7))} ${colour(v)}`);
+  console.log(`\n  ${mag('▸ memory')} ${bold(m.host)}${m.for ? dim(`  (nothing on ${m.for}; using the parent domain)`) : ''}`);
+  for (const r of m.recipes || []) {
+    row('recipe', `${bold(r.name)}  ${r.steps} steps · ${r.ok} ok${r.path ? ` · ${r.path}` : ''}${r.vars ? dim(`  needs ${r.vars.join(' ')}`) : ''}`, (x) => x);
+    if (wide) console.log(`            ${dim(r.flow)}`);
+  }
+  for (const t of m.traces || []) row('worked', `${t.flow}${dim(`   (${t.ms}ms${t.ran > 1 ? ` ×${t.ran}` : ''})`)}`);
+  if (m.works) row('works', m.works.join(dim(' · ')), (x) => x);
+  for (const a of m.avoid || []) row('avoid', a, yel);
+  for (const t of m.traps || []) row('trap', t, yel);
+  for (const n of m.notes || []) row('note', n, (x) => x);
+}
+
+// An ambiguous target is not an error, so it never reaches the red path — but
+// it is the single most likely reason a step "worked" and nothing happened.
+const amb = (r) =>
+  (r && r.n > 1 ? yel(`  ${DOT} ${r.n} matched`) : '') +
+  (r && r.inert ? red(`  ${DOT} disabled`) : '');
+
+function summary(a, r) {
+  if (!r || typeof r !== 'object') return dim(String(r ?? ''));
+  if (r.path) return `${blu(r.path)} ${dim(`${(r.bytes / 1024).toFixed(0)}kb`)}`;
+  if (r.inline) return dim(`${(r.bytes / 1024).toFixed(0)}kb base64 inline`);
+  if (a === 'read') return `${dim(trunc(r.title, 50))} ${dim(`${r.len} chars`)}`;
+  if (a === 'elements') return dim(`${r.n} elements`);
+  if (a === 'tabs') return dim(`${r.n} tabs`);
+  if (a === 'fill') return `${r.filled}/${r.of} fields`;
+  if (r.url) return dim(trunc(r.url, 90));
+  if (r.at) return dim(`@ ${r.at[0]},${r.at[1]}${r.trusted ? mag(' trusted') : ''}${r.covered ? yel(' covered') : ''}`);
+  if (r.value !== undefined) return dim(trunc(JSON.stringify(r.value), 110));
+  if (r.y !== undefined && r.max !== undefined) return dim(`y=${r.y}/${r.max}${r.atBottom ? ' (bottom)' : ''}`);
+  return dim(trunc(JSON.stringify(r), 110));
+}
+
+function detail(a, r) {
+  if (r && r.alt) for (const o of r.alt) {
+    console.log(`  ${dim('also')} ${yel(o.ref.padEnd(5))} ${trunc(o.css, 88)}${o.dis ? red(' disabled') : ''}`);
+  }
+  if (a === 'read' && r.text) console.log('\n' + r.text + '\n');
+  if (a === 'elements') for (const e of r.elements) {
+    console.log(`  ${yel(e.ref.padEnd(5))} ${dim(e.tag.padEnd(8))} ${trunc(e.name || '', 58).padEnd(58)} ${dim(`${e.box[0]},${e.box[1]}`)}${e.dis ? red(' disabled') : ''}`);
+  }
+  if (a === 'tabs') for (const t of r.tabs) {
+    console.log(`  ${(t.active ? grn('▸') : ' ')} ${yel(String(t.id).padEnd(6))} ${trunc(t.title, 46).padEnd(46)} ${dim(trunc(t.url, 60))}`);
+  }
+  if (a === 'read' && r.links) for (const l of r.links) console.log(`  ${trunc(l.text, 44).padEnd(44)} ${dim(trunc(l.href, 70))}`);
+  if (a === 'fill') for (const d of r.detail) if (!d.ok) console.log(`  ${BAD} ${d.sel} ${red(trunc(d.error, 80))}`);
+}
+
+const run = async (actions) => process.exit(render(await api('POST', '/do', { ...common(), actions })));
+
+// ── commands ─────────────────────────────────────────────────────────────
+const HELP = `
+${bold('bx')} ${dim('— drive Chrome from anything')}
+
+${bold('page')}
+  open <url>                  navigate current tab
+  back | forward | reload
+  read [target]               page text as markdown   ${dim('--mode text|html|md|links --max N')}
+  els [css]                   interactive elements with refs
+  shot [target]               screenshot              ${dim('--full --inline --maxWidth N')}
+  info
+
+${bold('act')}
+  click <target>              ${dim('--trusted --speed human|fast|instant')}
+                              ${dim('--has TEXT --near SEL --nth N  narrow an over-matching target')}
+  dblclick|rclick|hover <target>
+  type <target> <text>        ${dim('--enter --noclear --trusted')}
+  fill <sel=value>...         ${dim('--fast')}
+  press <keys>                ${dim('e.g. Enter, ctrl+a, ArrowDown')}
+  select <target> <value>
+  check|uncheck <target>
+  scroll [bottom|top|N]       ${dim('--target <sel> --by N')}
+  drag <from> <to>
+  upload <target> <file...>   ${dim('--dialog for custom widgets')}
+  wait <target>               ${dim('--gone --text "..." --ms N')}
+  eval <js>
+
+${bold('tabs')}
+  tabs | tab <id|match> | newtab [url] | close [id]
+
+${bold('memory')}  ${dim('bx learns every site as you drive it — flows, selectors, traps')}
+  memo [host]                 everything known about a site   ${dim('--all to list sites')}
+  learn <name>                name the flow you just ran      ${dim('--back N for an earlier one')}
+  recipe <name> [var=val...]  replay it            ${dim('bx memo names the vars')}
+  note <text>                 remember something about this site
+  forget [what] [host]        ${dim('all | notes | traces | traps | selectors | recipe <name>')}
+
+${bold('bridge')}
+  status | log [n] | start | stop | token | config [k=v...]
+  reload-ext                  restart the extension worker ${dim('(after an edit, or if it wedges)')}
+  do '<json>'                 raw batch: ${dim(`'[{"a":"click","target":"text=Next"}]'`)}
+
+${bold('targets')}  ${dim('css  ·  text=Sign in  ·  ref=e12  ·  role=button:Save  ·  label=Email  ·  placeholder=Search  ·  name=q  ·  xpath=//a')}
+         ${dim('several matches? bx picks the enabled one, prints "N matched" and lists the rest as refs.')}
+         ${dim('narrow with  --has TEXT  --near SEL  --nth N,  or click the ref it showed you.')}
+${bold('flags')}    ${dim('--tab <id> --speed <p> --timeout <ms> --json --keepgoing')}
+`;
+
+const target = (i = 0) => {
+  const sel = args[i];
+  if (flags.has === undefined && flags.near === undefined && flags.nth === undefined) return sel;
+  const t = { sel };
+  if (flags.has !== undefined) t.has = String(flags.has);
+  if (flags.near !== undefined) t.near = String(flags.near);
+  if (flags.nth !== undefined) t.nth = num(flags.nth);
+  return t;
+};
+
+async function main() {
+  const cmd = args.shift();
+  switch (cmd) {
+    case undefined:
+    case 'help': case '-h': case '--help':
+      console.log(HELP); return;
+
+    case 'start': {
+      const cfg = await ensureBridge(false);
+      const s = await api('GET', '/status');
+      console.log(`${OK} bridge on ${blu('127.0.0.1:' + cfg.port)}  ${s.connected ? grn('extension connected') : yel('waiting for extension')}`);
+      return;
+    }
+    case 'stop': { await api('POST', '/shutdown', {}); console.log(`${OK} bridge stopped`); return; }
+    case 'reload-ext': {
+      const was = (await api('GET', '/status')).extension?.since || 0;
+      const r = await api('POST', '/reload', {});
+      if (!r.ok) die(r.error);
+      // A reloaded worker dials in on a fresh socket, so `since` moves. An
+      // extension too old to know the reload message leaves it where it was.
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r2) => setTimeout(r2, 150));
+        const s2 = await api('GET', '/status');
+        if (s2.connected && (s2.extension?.since || 0) !== was) return void console.log(`${OK} extension reloaded`);
+      }
+      die('extension did not restart — reload it once at chrome://extensions');
+    }
+    case 'token': { console.log(config().token || ''); return; }
+
+    case 'status': {
+      const s = await api('GET', '/status');
+      if (flags.json) return void console.log(JSON.stringify(s, null, 2));
+      console.log(`  bridge     ${grn('up')}  ${dim('127.0.0.1:' + s.port + '  pid ' + s.pid)}`);
+      console.log(`  extension  ${s.connected ? grn('connected') : red('not connected')}  ${dim(s.extension.id || '')}`);
+      console.log(`  input      ${s.trusted ? mag('CDP trusted') : 'synthetic'} ${dim('·')} speed ${bold(s.speed)} ${dim('·')} timeout ${s.timeout}ms`);
+      console.log(`  config     ${dim(CFG_PATH)}`);
+      if (!s.connected) console.log(`\n  ${yel('→')} load ${bold(path.join(ROOT, 'extension'))} at ${blu('chrome://extensions')} (Developer mode → Load unpacked)`);
+      return;
+    }
+    case 'log': {
+      const n = Number(args[0] || 25);
+      const { log } = await api('GET', `/log?n=${n}`);
+      for (const l of log) console.log(`${dim(new Date(l.t).toLocaleTimeString())} ${l.kind.padEnd(4)} ${dim(trunc(JSON.stringify(l), 130))}`);
+      return;
+    }
+    case 'config': {
+      if (!args.length) return void console.log(JSON.stringify((await api('GET', '/config')).config, null, 2));
+      const patch = {};
+      for (const kv of args) { const [k, v] = kv.split('='); patch[k] = v === 'true' ? true : v === 'false' ? false : isNaN(+v) ? v : +v; }
+      console.log(JSON.stringify((await api('POST', '/config', patch)).config, null, 2));
+      return;
+    }
+    case 'do': {
+      let spec;
+      try { spec = JSON.parse(args.join(' ')); } catch (e) { die(`bad JSON: ${e.message}`); }
+      return run(Array.isArray(spec) ? spec : [spec]);
+    }
+
+    // ── memory ───────────────────────────────────────────────────────────
+    case 'memo': case 'memory': {
+      if (flags.all) {
+        const { hosts } = await api('GET', '/memory?all=1');
+        if (flags.json) return void console.log(JSON.stringify(hosts, null, 2));
+        if (!hosts.length) return void console.log(dim('  nothing learned yet — drive a site and bx will remember it'));
+        for (const h of hosts) {
+          console.log(`  ${bold(h.host.padEnd(30))} ${dim(`${h.runs} runs · ${h.recipes} recipes · ${h.traces} flows · ${h.notes} notes`)}  ${dim(new Date(h.updated).toLocaleString())}`);
+        }
+        return;
+      }
+      const r = await api('GET', `/memory${args[0] ? `?host=${encodeURIComponent(args[0])}` : ''}`);
+      if (flags.json) return void console.log(JSON.stringify(r.memory, null, 2));
+      if (r.error) die(r.error);
+      if (!r.digest) return void console.log(dim(`  nothing known about ${r.host || 'this site'} yet`));
+      recall(r.digest, true);
+      const m = r.memory;
+      console.log(dim(`\n  ${m.runs} batches since ${new Date(m.first).toLocaleDateString()}  ${DOT}  ${Object.keys(m.sel).length} selectors  ${DOT}  ${m.traces.length} flows`));
+      return;
+    }
+
+    case 'note': {
+      const text = args.join(' ');
+      if (!text) die('note what?');
+      const r = await api('POST', '/memory/note', { text, host: flags.host });
+      if (!r.ok) die(r.error);
+      console.log(`${OK} noted for ${bold(r.host)} ${dim(`(${r.notes} notes)`)}`);
+      return;
+    }
+
+    case 'learn': {
+      const name = args[0];
+      if (!name) die('learn what? give the flow a name, e.g. bx learn login');
+      const r = await api('POST', '/memory/learn', { name, host: flags.host, index: num(flags.back), note: flags.note === true ? undefined : flags.note });
+      if (!r.ok) die(r.error);
+      console.log(`${OK} ${bold(r.host)} knows ${bold(r.name)} ${dim(`— ${r.steps} steps`)}`);
+      console.log(`    ${dim(r.flow)}`);
+      console.log(dim(`    replay: bx recipe ${r.name}${r.vars.map((v) => ` '${v}=…'`).join('')}`));
+      return;
+    }
+
+    case 'recipe': case 'replay': {
+      const name = args.shift();
+      if (!name) die('replay what? bx memo shows the recipes for this site');
+      const vars = {};
+      for (const kv of args) { const i = kv.indexOf('='); if (i < 0) die(`recipe wants sel=value, got "${kv}"`); vars[kv.slice(0, i)] = kv.slice(i + 1); }
+      const out = await api('POST', '/do', { ...common(), recipe: name, vars, host: flags.host });
+      process.exit(render(out));
+    }
+
+    case 'forget': {
+      const what = args[0] || 'all';
+      const r = await api('POST', '/memory/forget', { what, name: args[1], host: flags.host || (what === 'all' ? args[1] : undefined) });
+      if (!r.ok) die(r.error);
+      console.log(`${OK} forgot ${bold(r.name || r.forgot)}${r.host ? dim(` on ${r.host}`) : ''}`);
+      return;
+    }
+
+    case 'open': case 'go': case 'nav': return run([{ a: 'nav', url: target() }]);
+    case 'back': return run([{ a: 'back' }]);
+    case 'forward': return run([{ a: 'forward' }]);
+    case 'reload': return run([{ a: 'reload', hard: !!flags.hard }]);
+    case 'info': return run([{ a: 'info' }]);
+
+    case 'click': case 'dblclick': case 'rclick': case 'hover':
+      return run([{ a: cmd, target: target(), button: flags.button, clicks: num(flags.clicks) }]);
+
+    case 'type': return run([{ a: 'type', target: target(), text: args.slice(1).join(' '), enter: !!flags.enter, clear: flags.noclear ? false : undefined }]);
+    case 'clear': return run([{ a: 'clear', target: target() }]);
+    case 'press': return run([{ a: 'press', keys: args, target: flags.target }]);
+    case 'select': return run([{ a: 'select', target: target(), value: args.slice(1).join(' ') }]);
+    case 'check': case 'uncheck': return run([{ a: cmd, target: target() }]);
+    case 'focus': return run([{ a: 'focus', target: target() }]);
+
+    case 'fill': {
+      const fields = {};
+      for (const kv of args) { const i = kv.indexOf('='); if (i < 0) die(`fill wants sel=value, got "${kv}"`); fields[kv.slice(0, i)] = kv.slice(i + 1); }
+      return run([{ a: 'fill', fields, fast: !!flags.fast }]);
+    }
+
+    case 'scroll': {
+      const to = args[0];
+      const a = { a: 'scroll', target: flags.target };
+      if (to === 'bottom' || to === 'top') a.to = to;
+      else if (to !== undefined && !isNaN(+to)) a.to = +to;
+      if (flags.by) a.by = [0, num(flags.by)];
+      if (flags.into) a.into = true;
+      return run([a]);
+    }
+
+    case 'drag': return run([{ a: 'drag', target: target(), to: args[1] }]);
+
+    case 'wait': {
+      const a = { a: 'wait' };
+      if (flags.ms) a.ms = num(flags.ms);
+      else if (flags.gone) a.gone = typeof flags.gone === 'string' ? flags.gone : target();
+      else if (flags.text) a.text = flags.text;
+      else if (flags.load) a.load = true;
+      else a.for = target();
+      return run([a]);
+    }
+
+    case 'read': return run([{ a: 'read', target: target(), mode: flags.mode, max: num(flags.max) }]);
+    case 'els': case 'elements': return run([{ a: 'elements', filter: args[0] || flags.filter, max: num(flags.max) }]);
+    case 'exists': return run([{ a: 'exists', target: target(), timeout: num(flags.timeout) ?? 0 }]);
+
+    case 'shot': case 'screenshot':
+      return run([{ a: 'shot', target: target(), fullPage: !!flags.full, format: flags.format, quality: num(flags.quality), maxWidth: num(flags.maxWidth) }]);
+
+    case 'upload': return run([{ a: 'upload', target: target(), files: args.slice(1).map((f) => path.resolve(f)), viaDialog: !!flags.dialog }]);
+    case 'eval': return run([{ a: 'eval', expr: args.join(' ') }]);
+    case 'cookies': return run([{ a: 'cookies', values: !!flags.values }]);
+
+    case 'tabs': return run([{ a: 'tabs' }]);
+    case 'tab': return run([{ a: 'tab', id: /^\d+$/.test(args[0] || '') ? +args[0] : args.join(' ') }]);
+    case 'newtab': return run([{ a: 'newtab', url: target(), active: flags.background ? false : true }]);
+    case 'close': return run([{ a: 'closetab', id: args[0] ? +args[0] : undefined }]);
+
+    default: die(`unknown command "${cmd}" — try ${bold('bx help')}`);
+  }
+}
+
+main().catch((e) => die(e.message));

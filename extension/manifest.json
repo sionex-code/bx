@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "bx",
+  "version": "1.1.0",
+  "description": "Local agent bridge.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "debugger",
+    "storage",
+    "alarms",
+    "webNavigation",
+    "cookies"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "sw.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_start",
+      "js": [
+        "content/core.js",
+        "content/mouse.js",
+        "content/keyboard.js",
+        "content/actions.js"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Deep Research Report — Polkadot · Filecoin · Dash (September 2026)</title>
+<style>
+  :root {
+    --bg: #0b0f1a;
+    --bg-2: #121a2c;
+    --panel: #182338;
+    --panel-2: #1f2c47;
+    --border: #2a3a5e;
+    --text: #e6edf7;
+    --muted: #8a99b8;
+    --accent: #6ea8ff;
+    --polkadot: #e6007a;
+    --filecoin: #0090ff;
+    --dash: #008ce7;
+    --green: #4ade80;
+    --red: #f87171;
+    --yellow: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 24px 80px; }
+  header.hero {
+    background: linear-gradient(135deg, #1a2240 0%, #0d1426 100%);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 36px 32px;
+    margin-bottom: 32px;
+  }
+  header.hero h1 {
+    font-size: 34px; margin: 0 0 12px;
+    background: linear-gradient(90deg, var(--polkadot), var(--filecoin), var(--dash));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  header.hero p.sub { margin: 0 0 18px; color: var(--muted); font-size: 15px; }
+  header.hero .meta {
+    display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px;
+  }
+  header.hero .pill {
+    background: var(--panel-2); border: 1px solid var(--border);
+    padding: 6px 12px; border-radius: 999px; color: var(--muted);
+  }
+  header.hero .pill strong { color: var(--text); }
+
+  /* TOC */
+  nav.toc {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 22px; margin-bottom: 32px;
+  }
+  nav.toc h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+  nav.toc ol { margin: 0; padding-left: 18px; }
+  nav.toc li { margin-bottom: 6px; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+
+  /* Coin sections */
+  section.coin {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 32px;
+    margin-bottom: 32px;
+    position: relative;
+    overflow: hidden;
+  }
+  section.coin::before {
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 4px;
+  }
+  section.coin.dot::before { background: var(--polkadot); }
+  section.coin.fil::before { background: var(--filecoin); }
+  section.coin.dash::before { background: var(--dash); }
+
+  .coin-header {
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 16px; margin-bottom: 8px;
+  }
+  .coin-title { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .coin-title h2 { margin: 0; font-size: 28px; }
+  .coin-title .symbol {
+    font-size: 16px; padding: 4px 10px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+  }
+  .coin-title .rank { color: var(--muted); font-size: 14px; }
+
+  .price-card {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 20px;
+  }
+  .price-card .label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+  .price-card .price { font-size: 30px; font-weight: 700; margin: 4px 0 2px; }
+  .price-card .change { font-size: 14px; }
+  .price-card .change.up { color: var(--green); }
+  .price-card .change.down { color: var(--red); }
+  .price-card .small { font-size: 12px; color: var(--muted); }
+
+  h3 {
+    margin: 28px 0 10px; font-size: 18px;
+    border-bottom: 1px solid var(--border); padding-bottom: 8px;
+  }
+  p { margin: 0 0 12px; color: #d4dcec; }
+  ul, ol { color: #d4dcec; padding-left: 22px; }
+  ul li, ol li { margin-bottom: 6px; }
+  strong { color: #f1f5fb; }
+
+  /* Stat grid */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px; margin: 16px 0 8px;
+  }
+  .stat {
+    background: var(--panel-2); border: 1px solid var(--border);
+    padding: 14px; border-radius: 10px;
+  }
+  .stat .k { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+  .stat .v { font-size: 17px; font-weight: 600; margin-top: 4px; }
+  .stat .v.green { color: var(--green); }
+  .stat .v.red { color: var(--red); }
+
+  /* Tables */
+  table {
+    width: 100%; border-collapse: collapse;
+    background: var(--panel-2); border-radius: 10px; overflow: hidden;
+    margin: 12px 0; font-size: 14px;
+  }
+  th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { background: var(--panel); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+  tr:last-child td { border-bottom: none; }
+
+  /* Callouts */
+  .callout {
+    border-left: 4px solid var(--accent);
+    background: var(--panel-2);
+    padding: 14px 18px; border-radius: 8px; margin: 14px 0;
+  }
+  .callout.warn { border-color: var(--yellow); }
+  .callout.good { border-color: var(--green); }
+  .callout.bad { border-color: var(--red); }
+  .callout .title { font-weight: 700; margin-bottom: 6px; }
+
+  /* Verdict */
+  .verdict {
+    background: linear-gradient(135deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 22px; margin-top: 14px;
+  }
+  .verdict .row {
+    display: flex; align-items: center; gap: 14px;
+    padding: 10px 0; border-bottom: 1px dashed var(--border);
+  }
+  .verdict .row:last-child { border-bottom: none; }
+  .verdict .row .label { width: 130px; color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 1px; }
+  .verdict .row .val { font-weight: 600; }
+  .badge {
+    display: inline-block; padding: 4px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+  }
+  .badge.bull { background: rgba(74,222,128,0.15); color: var(--green); border: 1px solid var(--green); }
+  .badge.neutral { background: rgba(251,191,36,0.15); color: var(--yellow); border: 1px solid var(--yellow); }
+  .badge.bear { background: rgba(248,113,113,0.15); color: var(--red); border: 1px solid var(--red); }
+
+  /* Comparison */
+  section.compare {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 16px; padding: 32px; margin-bottom: 32px;
+  }
+  section.compare h2 { margin-top: 0; }
+
+  /* Footer */
+  footer {
+    margin-top: 40px; padding: 20px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; color: var(--muted); font-size: 13px;
+  }
+  footer p { margin: 0 0 6px; color: var(--muted); }
+  footer a { color: var(--accent); text-decoration: none; }
+
+  @media (max-width: 720px) {
+    .wrap { padding: 16px 12px 60px; }
+    section.coin, section.compare, nav.toc { padding: 20px; }
+    header.hero { padding: 24px 18px; }
+    header.hero h1 { font-size: 26px; }
+    .coin-title h2 { font-size: 22px; }
+    .price-card .price { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Polkadot · Filecoin · Dash</h1>
+    <p class="sub">Deep research report covering current price, technology, ecosystem, roadmap, recent catalysts, and forward outlook — compiled September 2026 from on-chain data aggregators, official project sources, and major crypto media.</p>
+    <div class="meta">
+      <span class="pill"><strong>Compiled:</strong> Sep 8, 2026</span>
+      <span class="pill"><strong>Sources:</strong> CoinGecko, CoinMarketCap, CoinDesk, Wikipedia, official project blogs & wikis</span>
+      <span class="pill"><strong>Assets covered:</strong> DOT · FIL · DASH</span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#market-snapshot">Market snapshot at a glance</a></li>
+      <li><a href="#polkadot">Polkadot (DOT) — Layer-0 multi-chain platform</a></li>
+      <li><a href="#filecoin">Filecoin (FIL) — Decentralized storage network</a></li>
+      <li><a href="#dash">Dash (DASH) — Payments-focused digital cash</a></li>
+      <li><a href="#comparison">Side-by-side comparison</a></li>
+      <li><a href="#outlook">Cross-asset outlook &amp; risks</a></li>
+    </ol>
+  </nav>
+
+  <!-- ============================================================ -->
+  <section id="market-snapshot" class="compare">
+    <h2>Market snapshot at a glance</h2>
+    <p>All three coins trade well below their all-time highs but have rallied hard over the past year as the broader market recovered from its 2025 cycle low. The table below condenses the key numbers observed on <strong>September 8, 2026</strong>.</p>
+    <table>
+      <thead>
+        <tr><th>Metric</th><th>Polkadot (DOT)</th><th>Filecoin (FIL)</th><th>Dash (DASH)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Price</td><td>$1.08</td><td>$0.86</td><td>$63.17</td></tr>
+        <tr><td>24h change</td><td>−1.7%</td><td>+0.2%</td><td>−5.3%</td></tr>
+        <tr><td>7d change</td><td>+25.0%</td><td>+21.9%</td><td>+38.2%</td></tr>
+        <tr><td>30d change</td><td>+32.7%</td><td>+19.3%</td><td>+98.1%</td></tr>
+        <tr><td>1y change</td><td>+73.3%</td><td>+65.1%</td><td>+148.2%</td></tr>
+        <tr><td>Market cap</td><td>$1.85 B</td><td>$0.71 B</td><td>$0.81 B</td></tr>
+        <tr><td>24h volume</td><td>$338 M</td><td>$108 M</td><td>$185 M</td></tr>
+        <tr><td>Rank (CoinGecko)</td><td>#48</td><td>#91</td><td>#83</td></tr>
+        <tr><td>Circulating supply</td><td>1.702 B</td><td>827 M</td><td>12.83 M</td></tr>
+        <tr><td>Max supply</td><td>2.1 B</td><td>∞ (no cap)</td><td>18.92 M</td></tr>
+        <tr><td>All-time high</td><td>$54.98 (Nov 2021)</td><td>$236.84 (Apr 2021)</td><td>$1,493.59 (Dec 2017)</td></tr>
+        <tr><td>All-time low</td><td>$0.7270 (Aug 2026)</td><td>$0.6124 (Aug 2026)</td><td>$0.2139 (Feb 2014)</td></tr>
+        <tr><td>Drawdown from ATH</td><td>−98.0%</td><td>−99.6%</td><td>−95.8%</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <div class="title">What the snapshot tells us</div>
+      All three are firmly in "deep value" territory by historical standards, sitting 95–99% below their all-time highs while having just printed new all-time lows in August 2026 before bouncing sharply. Year-over-year returns are double-digit to triple-digit, and 30-day momentum is broadly positive — Dash is the current leader on momentum, Polkadot second, Filecoin a close third.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="polkadot" class="coin dot">
+    <div class="coin-header">
+      <div class="coin-title">
+        <h2>Polkadot</h2>
+        <span class="symbol">DOT</span>
+        <span class="rank">Layer-0 multi-chain · Smart Contract Platform · Rank #48</span>
+      </div>
+      <div class="price-card">
+        <div class="label">Price · Sep 8, 2026</div>
+        <div class="price">$1.08</div>
+        <div class="change down">−1.7% (24h)</div>
+        <div class="small">+25.0% (7d) · +73.3% (1y)</div>
+      </div>
+    </div>
+
+    <h3>What is Polkadot?</h3>
+    <p>Polkadot is a <strong>Layer-0, open-source blockchain platform</strong> that lets many independent blockchains (parachains) connect, share security, and interoperate through a central Relay Chain. It is heterogeneous — it makes no assumptions about the structure of the chains it hosts, so even non-blockchain data structures can become parachains if they meet the protocol's criteria.</p>
+    <p>The native cryptocurrency <strong>DOT</strong> powers governance, staking (Nominated Proof-of-Stake), and — since Polkadot 2.0 — a coretime marketplace for buying blockspace.</p>
+
+    <h3>Founders &amp; origins</h3>
+    <ul>
+      <li><strong>Gavin Wood</strong> — Ethereum co-founder, Solidity creator, Parity Technologies founder. Published the Polkadot white paper in 2016.</li>
+      <li><strong>Robert Habermeier</strong> — Thiel Fellow with a cryptography and blockchain background.</li>
+      <li><strong>Peter Czaban</strong> — fintech background.</li>
+      <li><strong>Web3 Foundation</strong> (Zug, Switzerland) funds Polkadot development. Core protocol is built by <strong>Parity Technologies</strong>.</li>
+      <li><strong>ICO:</strong> October 2017, raised over <strong>$144.3M</strong>. A Parity multi-sig vulnerability froze a portion of those funds shortly after.</li>
+      <li><strong>Mainnet launch:</strong> May 26, 2020 (proof-of-authority first, then NPoS in June 2020). Parachains went live December 2021.</li>
+    </ul>
+
+    <div class="stats">
+      <div class="stat"><div class="k">Market cap</div><div class="v">$1.85 B</div></div>
+      <div class="stat"><div class="k">24h volume</div><div class="v">$338 M</div></div>
+      <div class="stat"><div class="k">Circulating</div><div class="v">1.702 B DOT</div></div>
+      <div class="stat"><div class="k">Max supply</div><div class="v">2.1 B DOT</div></div>
+      <div class="stat"><div class="k">FDV</div><div class="v">$2.28 B</div></div>
+      <div class="stat"><div class="k">All-time high</div><div class="v">$54.98</div></div>
+      <div class="stat"><div class="k">All-time low</div><div class="v">$0.7270</div></div>
+      <div class="stat"><div class="k">ATH drawdown</div><div class="v red">−98.0%</div></div>
+    </div>
+
+    <h3>Technical architecture</h3>
+    <ul>
+      <li><strong>Relay Chain</strong> — Polkadot's central chain. Provides shared security, consensus, and inter-chain interoperability.</li>
+      <li><strong>Parachains</strong> — App-specific blockchains running in parallel, validated by Relay Chain validators. Each is built using the <strong>Polkadot SDK</strong> (formerly Substrate) and registers a Wasm state-transition function on the relay chain.</li>
+      <li><strong>Collators</strong> — Full nodes that produce parachain block candidates and submit Proofs-of-Verification to the relay chain.</li>
+      <li><strong>NPoS</strong> — Nominated Proof-of-Stake. Validators produce blocks; nominators back validators with staked DOT. Consensus uses <strong>BABE</strong> (Blind Assignment for Blockchain Extension, derived from Ouroboros) plus <strong>GRANDPA</strong> for finality.</li>
+      <li><strong>XCM (Cross-Consensus Messaging)</strong> — Standard for moving arbitrary data between parachains. Bridging typically completes in &lt; 60 seconds because parachains share security.</li>
+      <li><strong>OpenGov</strong> — On-chain governance that replaced Governance V1. Stakeholders vote on referenda; Council members and validators are selected via the Phragmén election method.</li>
+      <li><strong>Code:</strong> Rust, GPL-3.0, cross-platform. Repository: <code>github.com/paritytech/polkadot-sdk</code>.</li>
+    </ul>
+
+    <h3>Polkadot 2.0 — Agile Coretime (live)</h3>
+    <p>Polkadot 2.0 is a structural shift from "chain-focused" to "application-focused" economics. Instead of parachains leasing a slot for up to two years via auctions, parachains now purchase <strong>coretime</strong> — blockspace on the relay chain — in a marketplace.</p>
+    <ul>
+      <li><strong>Bulk coretime</strong> — A 28-day region sold as an NFT, renewable monthly with price-fluctuation protection.</li>
+      <li><strong>On-demand coretime</strong> — Pay-per-block access to a relay chain core, replacing the old "parathreads" concept.</li>
+      <li><strong>Splitting &amp; interlacing</strong> — Coretime can be subdivided and resold, enabling secondary markets and better utilisation.</li>
+      <li><strong>Elastic Scaling</strong> — Parachains can dynamically allocate cores based on traffic; preliminary tests ran 80 cores at 12-second block times.</li>
+      <li><strong>Coretime revenue is burned</strong>, creating a deflationary sink tied to network usage.</li>
+    </ul>
+    <div class="callout">
+      <div class="title">Implication for DOT</div>
+      Lower entry barrier for builders (no more multi-million-dollar auction bids), better blockspace utilisation, and a continuous buy-pressure / burn loop on DOT that ties token value to real on-chain activity — provided parachain demand grows.
+    </div>
+
+    <h3>Stress-test benchmark</h3>
+    <p>In December 2024, Polkadot's canary network <strong>Kusama</strong> ran "The Spammening", sustaining approximately <strong>143,000 transactions per second</strong> at only 23% network capacity — strong evidence that the multi-core architecture can scale beyond current demand.</p>
+
+    <h3>Ecosystem</h3>
+    <table>
+      <thead><tr><th>Category</th><th>Notable projects</th></tr></thead>
+      <tbody>
+        <tr><td>Wallets</td><td>Nova, Talisman, SubWallet, Polkadot Vault (air-gapped), Ledger (native)</td></tr>
+        <tr><td>Bridges</td><td>Snowbridge (↔ Ethereum, light-client), Hyperbridge (↔ Base, Optimism, Arbitrum, BSC)</td></tr>
+        <tr><td>DeFi</td><td>Hydration (Omnipool unified liquidity), Bifrost (vDOT liquid staking)</td></tr>
+        <tr><td>Tooling</td><td>Subscan (block explorer), Subsquare (governance), Polkadot.js</td></tr>
+        <tr><td>Identity / Naming</td><td><code>.dot</code> domain names (via Polkadot Names), on-chain identity pallet</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Recent news &amp; catalysts</h3>
+    <ul>
+      <li><strong>Coinbase unlocks Polkadot ↔ USDC integration</strong> — Dec 16, 2025; volume rose ~17% above monthly averages on the announcement.</li>
+      <li><strong>Grayscale withdraws DOT crypto ETF filing</strong> — a near-term blow to institutional-access hopes.</li>
+      <li><strong>Polkadot 2.0 / Agile Coretime</strong> is live; parachain slot auctions and crowdloans have been deprecated. Existing lease DOT was auto-converted to coretime.</li>
+      <li><strong>March 14, 2026 — Issuance Cut / "Pi Day Hard Cap"</strong> — described in ecosystem coverage as Polkadot's effective halving. Reduces DOT inflation at the protocol level.</li>
+      <li><strong>Price action (last 30d):</strong> Recovered from the August all-time low of $0.7270 into the $1.04–$1.11 band; support building at $1.04, resistance around $1.10–$1.11.</li>
+    </ul>
+
+    <h3>Forward outlook</h3>
+    <table>
+      <thead><tr><th>Source</th><th>2026 outlook</th><th>2030 outlook</th></tr></thead>
+      <tbody>
+        <tr><td>PrimeXBT (Aug 2026)</td><td>$0.745 – $0.971 (avg ~$0.85)</td><td>—</td></tr>
+        <tr><td>Crypto News</td><td>$2.61 – $2.69 range</td><td>avg ~$4.99</td></tr>
+        <tr><td>Coincub</td><td>Calls out March 14, 2026 issuance cut as primary macro driver</td><td>—</td></tr>
+        <tr><td>Coinpedia</td><td>Recovery scenario from $1.20 lows</td><td>Long-term target band</td></tr>
+      </tbody>
+    </table>
+    <p>Forecasts are sharply divergent. Conservative desks (PrimeXBT) see DOT catching its breath near $1; bullish desks (Crypto News) see the post-halving supply shock pushing it past $4 by 2030. Both ends agree the issuance cut is the single biggest 2026 catalyst.</p>
+
+    <div class="verdict">
+      <div class="row"><span class="label">Bull case</span><span class="val">Agile Coretime drives real blockspace demand → DOT burns; Pi Day issuance cut removes supply pressure; recovering parachain ecosystem.</span></div>
+      <div class="row"><span class="label">Bear case</span><span class="val">Grayscale ETF withdrawal reduces institutional access; parachain slot economy still in transition; competition from Cosmos, Avalanche, and Ethereum L2s.</span></div>
+      <div class="row"><span class="label">Risk profile</span><span class="val">Medium — proven tech, but adoption is the open question.</span></div>
+      <div class="row"><span class="label">Sentiment</span><span class="val"><span class="badge bull">Bullish (community 91%)</span></span></div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="filecoin" class="coin fil">
+    <div class="coin-header">
+      <div class="coin-title">
+        <h2>Filecoin</h2>
+        <span class="symbol">FIL</span>
+        <span class="rank">Decentralized storage · DePIN · Rank #91</span>
+      </div>
+      <div class="price-card">
+        <div class="label">Price · Sep 8, 2026</div>
+        <div class="price">$0.86</div>
+        <div class="change up">+0.2% (24h)</div>
+        <div class="small">+21.9% (7d) · +65.1% (1y)</div>
+      </div>
+    </div>
+
+    <h3>What is Filecoin?</h3>
+    <p>Filecoin is a <strong>decentralized storage network</strong> that turns unused hard-drive capacity worldwide into a paid storage market. It is the incentive layer on top of <strong>IPFS</strong> (InterPlanetary File System). Customers pay storage providers in <strong>FIL</strong>; storage providers post collateral and submit cryptographic proofs that they continue to store the data.</p>
+
+    <h3>Founders &amp; origins</h3>
+    <ul>
+      <li><strong>Protocol Labs</strong>, founded by <strong>Juan Benet</strong>. White paper published July 2014.</li>
+      <li><strong>ICO:</strong> August 10, 2017 — one of the largest token sales in history. Raised <strong>$200M+ in ~30 minutes</strong>. ICO price started at $1 and rose $1 per $40M raised, capped at $6.</li>
+      <li><strong>Mainnet:</strong> October 15, 2020.</li>
+      <li><strong>Notable advisors/board members:</strong> Brewster Kahle (Internet Archive), Joe Lubin (Ethereum/Consensys), Denelle Dixon (Stellar).</li>
+    </ul>
+
+    <div class="stats">
+      <div class="stat"><div class="k">Market cap</div><div class="v">$707 M</div></div>
+      <div class="stat"><div class="k">24h volume</div><div class="v">$108 M</div></div>
+      <div class="stat"><div class="k">Circulating</div><div class="v">827 M FIL</div></div>
+      <div class="stat"><div class="k">Outstanding</div><div class="v">1.655 B FIL</div></div>
+      <div class="stat"><div class="k">Max supply</div><div class="v">∞ (uncapped)</div></div>
+      <div class="stat"><div class="k">Network capacity</div><div class="v">1.95 EiB</div></div>
+      <div class="stat"><div class="k">Large clients (&gt;1 TiB)</div><div class="v">482</div></div>
+      <div class="stat"><div class="k">FVM contracts</div><div class="v">5,000+</div></div>
+    </div>
+
+    <h3>Technical architecture</h3>
+    <ul>
+      <li><strong>Proof of Replication (PoRep)</strong> — A storage provider proves it has encoded a unique copy of the data.</li>
+      <li><strong>Proof of Spacetime (PoST)</strong> — Continuous proof, over time, that the data is still being stored.</li>
+      <li><strong>Storage Providers (SPs)</strong> — The equivalent of miners. They lock FIL as collateral and earn block rewards plus deal payments.</li>
+      <li><strong>FIL+</strong> — A program that boosts rewards for SPs who onboard verified, useful client data (not just capacity-padding).</li>
+      <li><strong>Filecoin Virtual Machine (FVM)</strong> — Smart-contract execution layer (EVM-compatible, FEVM). Enables programmable storage deals, oracles, and cross-chain bridges.</li>
+      <li><strong>Implementations:</strong> Lotus (reference), Forest (Rust), go-filecoin (legacy).</li>
+    </ul>
+
+    <h3>Filecoin Onchain Cloud (mainnet March 26, 2026)</h3>
+    <p>The defining 2026 product launch. <strong>Filecoin Onchain Cloud</strong> turns the storage network into a programmable, verifiable cloud for AI agents and data pipelines:</p>
+    <ul>
+      <li><strong>Onchain proofs</strong> of storage state and retrieval.</li>
+      <li><strong>Smart-contract-based payments</strong> for storage and retrieval, settled directly in FIL.</li>
+      <li><strong>Two-copy replication</strong> for stronger durability guarantees.</li>
+      <li><strong>Native IPFS integration</strong>, cross-chain data bridges, and FEVM programmability.</li>
+    </ul>
+    <p>The official 2026 Filecoin Network Strategy explicitly frames the moment as "an inflection point for data infrastructure driven by AI", shifting the network's focus from raw capacity to <strong>paid, onchain, verifiable demand</strong>.</p>
+
+    <h3>Other 2026 upgrades</h3>
+    <ul>
+      <li><strong>NV28 "Fire Horse"</strong> network upgrade — mainnet May 27, 2026. Improvements to usability, trust, and performance for real business workloads.</li>
+      <li><strong>Solstice proposal</strong> (July 17, 2026) — described as "one of the most significant changes to Filecoin's reward system since the network launched." Shifts the network toward a service-economy model.</li>
+      <li><strong>ProPGF Batch 3</strong> — ~$1.4M committed (Aug 19, 2026) for builders across customer-facing products, SP growth tools, and AI infrastructure.</li>
+      <li><strong>CloudPaws</strong> identity program (Jan 2026) — 100 NFTs recognising early Filecoin Onchain Cloud contributors.</li>
+    </ul>
+
+    <h3>Use cases &amp; ecosystem</h3>
+    <ul>
+      <li><strong>Storage for AI training data, model artifacts, and inference pipelines</strong> — the central narrative for the 2026 cycle.</li>
+      <li><strong>Cultural archives &amp; scientific datasets</strong> — Internet Archive, Wikipedia mirrors, scientific research corpora.</li>
+      <li><strong>Power-chain storage</strong> for dApps, data-heavy SaaS platforms, and immutable archives.</li>
+      <li>Competitors in the storage sector: <strong>Arweave</strong>, <strong>Storj</strong>, <strong>Siacoin</strong>, <strong>BitTorrent</strong>.</li>
+    </ul>
+
+    <h3>Supply dynamics — the FIL vesting cliff</h3>
+    <div class="callout good">
+      <div class="title">Issuance set to drop ~75%</div>
+      The FIL token-vesting schedule approaches its terminal phase, after which new issuance falls by roughly three-quarters. Combined with the Solstice-driven shift to a service-economy reward model, this is a major supply-side catalyst into 2027–2028.
+    </div>
+
+    <h3>Recent news &amp; price action</h3>
+    <ul>
+      <li><strong>Jan 5, 2026</strong> — FIL surged 6%, outperforming the broader market.</li>
+      <li><strong>Jan 6, 2026</strong> — heavy volume, more than double the 30-day average.</li>
+      <li><strong>Dec 22, 2025</strong> — broke above the $1.29 resistance zone on 87% volume surge; institutions accumulating on dips.</li>
+      <li><strong>Current technical picture:</strong> trading near the apex of a descending-wedge compression. Supertrend support at $0.8225; recent high $0.8821. Bullish bias above the Supertrend with TP levels at $0.865, $0.882, $0.910.</li>
+      <li><strong>Sentiment:</strong> Community is 100% bullish (CoinGecko user poll, sample of recent voters).</li>
+    </ul>
+
+    <h3>Forward outlook</h3>
+    <table>
+      <thead><tr><th>Source</th><th>2026</th><th>2030</th></tr></thead>
+      <tbody>
+        <tr><td>Coinbase model (5% CAGR)</td><td>$0.83</td><td>$1.01</td></tr>
+        <tr><td>Coinpedia</td><td>Long-term $50 target discussed</td><td>Multi-year supply-cliff thesis</td></tr>
+        <tr><td>Bitunix</td><td>Tied to FVM growth &amp; DePIN adoption</td><td>DePIN cycle upside</td></tr>
+      </tbody>
+    </table>
+    <p>The dispersion between conservative and bullish models is enormous. Conservative numbers assume little adoption change; bullish numbers assume the AI-data-storage thesis plays out and supply-cliff + Solstice reward changes create a tightening market. The "Solstice + vesting-end" combination is the binary risk-on catalyst for 2026–2027.</p>
+
+    <div class="verdict">
+      <div class="row"><span class="label">Bull case</span><span class="val">AI agents need verifiable, decentralised storage; Onchain Cloud is the right product at the right time; ~75% issuance cut + Solstice reward changes tighten supply.</span></div>
+      <div class="row"><span class="label">Bear case</span><span class="val">No hard supply cap; storage demand still dominated by a handful of clients; competing with Arweave and traditional hyperscalers (AWS, Google Cloud) on price &amp; UX.</span></div>
+      <div class="row"><span class="label">Risk profile</span><span class="val">High — binary outcomes tied to AI-storage thesis and network-upgrade execution.</span></div>
+      <div class="row"><span class="label">Sentiment</span><span class="val"><span class="badge bull">Strongly Bullish (100% community poll)</span></span></div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="dash" class="coin dash">
+    <div class="coin-header">
+      <div class="coin-title">
+        <h2>Dash</h2>
+        <span class="symbol">DASH</span>
+        <span class="rank">Privacy · Payments · DAO · Rank #83</span>
+      </div>
+      <div class="price-card">
+        <div class="label">Price · Sep 8, 2026</div>
+        <div class="price">$63.17</div>
+        <div class="change down">−5.3% (24h)</div>
+        <div class="small">+38.2% (7d) · +148.2% (1y)</div>
+      </div>
+    </div>
+
+    <h3>What is Dash?</h3>
+    <p>Dash — short for "<strong>d</strong>igital <strong>cash</strong>" — is a peer-to-peer cryptocurrency forked from Bitcoin in 2014 and optimised for everyday payments: sub-second confirmations, sub-cent fees, optional privacy, and decentralised self-funding through masternode governance.</p>
+
+    <h3>Founders &amp; origins</h3>
+    <ul>
+      <li><strong>Evan Duffield</strong> — sole original author. Launched the project on <strong>January 18, 2014</strong> as <em>XCoin</em>, rebranded to <em>Darkcoin</em>, then to <em>Dash</em> in March 2015.</li>
+      <li>A flaw in the inherited Litecoin difficulty-adjustment code released ~2M DASH in the first 48 hours — a long-running source of controversy about distribution fairness.</li>
+      <li>The Dash DAO funded a blockchain research lab at Arizona State University (2017). By April 2018 it was a top-12 crypto with a ~$4.3B market cap.</li>
+      <li><strong>Venezuela adoption</strong> — Dash was the most popular cryptocurrency in Venezuela by 2019 (Der Spiegel), and Venezuela's state-issued Petro copied Dash's X11 algorithm.</li>
+    </ul>
+
+    <div class="stats">
+      <div class="stat"><div class="k">Market cap</div><div class="v">$810 M</div></div>
+      <div class="stat"><div class="k">24h volume</div><div class="v">$185 M</div></div>
+      <div class="stat"><div class="k">Circulating</div><div class="v">12.83 M DASH</div></div>
+      <div class="stat"><div class="k">Max supply</div><div class="v">18.92 M</div></div>
+      <div class="stat"><div class="k">Block time</div><div class="v">2.5 min</div></div>
+      <div class="stat"><div class="k">Block reward</div><div class="v">~1.906 DASH</div></div>
+      <div class="stat"><div class="k">All-time high</div><div class="v">$1,493.59</div></div>
+      <div class="stat"><div class="k">All-time low</div><div class="v">$0.2139</div></div>
+    </div>
+
+    <h3>Technical architecture</h3>
+    <ul>
+      <li><strong>Two-tier network.</strong>
+        <ul>
+          <li><strong>Miners</strong> — proof-of-work (X11 hashing algorithm, eleven rounds of hashing) producing new blocks every 2.5 minutes.</li>
+          <li><strong>Masternodes</strong> — full nodes that lock <strong>1,000 DASH</strong> as collateral. They provide InstantSend, PrivateSend, ChainLocks, and run the DAO voting process. They also receive a share of block rewards.</li>
+        </ul>
+      </li>
+      <li><strong>InstantSend</strong> — typically confirms transactions in <strong>under one second</strong> for point-of-sale use cases.</li>
+      <li><strong>ChainLocks</strong> — long-range-attack / 51% defense via masternode quorum signatures.</li>
+      <li><strong>PrivateSend</strong> — optional CoinJoin-style transaction mixing for privacy.</li>
+      <li><strong>DAO governance</strong> — masternodes vote on proposals; <strong>10% of block rewards</strong> are allocated to a treasury that funds approved proposals (development, marketing, integrations). This self-funding DAO structure is Dash's defining innovation.</li>
+      <li><strong>Cost per transaction:</strong> typically &lt; $0.01.</li>
+    </ul>
+
+    <h3>Dash Evolution</h3>
+    <p>Dash's long-running roadmap project. Evolution aims to add a decentralized identity (DIP-002 / DIP-003), usernames instead of addresses, and a stateful DAPI layer so that third-party apps can interact with Dash without running a full node. The pitch: "decentralized information, much like cryptocurrency gave us decentralized money". Evolution has been slow to ship — a recurring criticism — but remains the project's most ambitious forward-looking bet.</p>
+
+    <h3>Ecosystem &amp; adoption</h3>
+    <ul>
+      <li><strong>DashPay wallet</strong> — mobile and desktop apps.</li>
+      <li><strong>DashDirect app</strong> — lets users spend DASH at 155K+ US retailers via gift-card integrations, with discounts of up to 12%.</li>
+      <li><strong>FastPass / Institutional services</strong> — payment processing for merchants.</li>
+      <li><strong>Strong in emerging markets</strong> historically (Venezuela, Colombia, parts of Africa) where cash alternatives are scarce.</li>
+    </ul>
+
+    <h3>Recent news &amp; catalysts</h3>
+    <ul>
+      <li><strong>Privacy-coin rotation (Oct 10, 2025)</strong> — CoinDesk headline: <em>"Privacy Tokens Zcash, Dash, Railgun Rip Higher as Market Rotates Back to 2018 Narratives."</em> Capital rotated into the once-forgotten privacy sector at a moment broader liquidity was searching for a narrative.</li>
+      <li><strong>DASHCON event</strong> — community-driven event coincided with a breakout above $46–$48 on the 4H chart with sustained higher lows.</li>
+      <li><strong>DASH Rockets Above $65 On Jobs Data</strong> — recent macro-linked surge.</li>
+      <li><strong>Dash Shielded Pool</strong> is live — balance reported regularly by Dash Italia and others.</li>
+      <li><strong>Trending on CoinMarketCap (Sep 5, 2026):</strong> +43.99% daily move, $526.9M volume. Rank climbed into the top 60.</li>
+      <li><strong>Current technical picture:</strong> Trading in a $60–$66 range after rejecting the $63.50–$63.70 zone; support $60–$62, resistance $70–$72. A 4H close back below $41–$42 would weaken structure.</li>
+    </ul>
+
+    <h3>Regulatory landscape — the cloud over privacy coins</h3>
+    <div class="callout warn">
+      <div class="title">Regulatory headwinds</div>
+      <ul>
+        <li>Tagged <strong>"Alleged SEC Securities"</strong> on CoinMarketCap.</li>
+        <li><strong>Bittrex delisted</strong> Dash (alongside Monero and Zcash) in January 2021.</li>
+        <li><strong>eToro delisted</strong> Dash for U.S. users in mid-2023.</li>
+        <li><strong>EU leaked draft (Nov 2022)</strong> considered banning privacy-enhancing coins at crypto providers and banks.</li>
+      </ul>
+      These structural pressures keep many Western exchanges wary of listing privacy coins, which suppresses liquidity relative to non-private peers.
+    </div>
+
+    <h3>Forward outlook</h3>
+    <table>
+      <thead><tr><th>Source</th><th>2026</th><th>2029</th><th>2032</th></tr></thead>
+      <tbody>
+        <tr><td>MSN / aggregators</td><td>max ~$95</td><td>max ~$165</td><td>max ~$225</td></tr>
+        <tr><td>Coinpedia</td><td>Privacy-focused growth thesis</td><td>Long-term target band</td><td>—</td></tr>
+        <tr><td>LiteFinance</td><td>Multi-year forecast</td><td>—</td><td>—</td></tr>
+      </tbody>
+    </table>
+    <p>Dash has the strongest 30-day momentum of the three (+98.1%) on the back of the privacy-coin narrative rotation and the DASHCON-driven rally. If privacy-coin delistings continue to be net-neutral or net-positive (i.e. surviving exchanges see concentrated liquidity), Dash is well-positioned to outperform in the next narrative cycle. The structural ceiling is real — regulatory risk and the gradual delisting of privacy coins across Western venues — but the same dynamic that hurt it in 2021–2023 is now feeding it in 2025–2026 as surviving privacy-coin liquidity concentrates.</p>
+
+    <div class="verdict">
+      <div class="row"><span class="label">Bull case</span><span class="val">Privacy-coin narrative rotation; sub-second, sub-cent payments remain real-world useful; Venezuela-style emerging-market wedge.</span></div>
+      <div class="row"><span class="label">Bear case</span><span class="val">SEC allegations; ongoing exchange delistings; EU AML pressure; no fresh technical catalyst at the protocol level.</span></div>
+      <div class="row"><span class="label">Risk profile</span><span class="val">High — narrative-driven and regulatory-risk-heavy, but with very tight supply (max 18.9M).</span></div>
+      <div class="row"><span class="label">Sentiment</span><span class="val"><span class="badge bull">Bullish (community 62%)</span></span></div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="comparison" class="compare">
+    <h2>Side-by-side comparison</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Dimension</th>
+          <th style="color:var(--polkadot)">Polkadot (DOT)</th>
+          <th style="color:var(--filecoin)">Filecoin (FIL)</th>
+          <th style="color:var(--dash)">Dash (DASH)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Category</td><td>Layer-0 multi-chain</td><td>Decentralized storage</td><td>Payments · Privacy</td></tr>
+        <tr><td>Consensus</td><td>NPoS (BABE + GRANDPA)</td><td>PoRep + PoST</td><td>PoW (X11) + masternode quorum</td></tr>
+        <tr><td>Smart contracts</td><td>Yes (multiple parachains)</td><td>Yes (FVM / FEVM)</td><td>Limited (Evolution roadmap)</td></tr>
+        <tr><td>Supply model</td><td>Inflationary, capped at 2.1B; reduced by issuance cuts</td><td>Inflationary, no hard cap; vesting-driven issuance cliff ahead</td><td>Disinflationary; ~18.9M hard cap</td></tr>
+        <tr><td>Market cap</td><td>$1.85 B (largest of the three)</td><td>$0.71 B</td><td>$0.81 B</td></tr>
+        <tr><td>30d performance</td><td>+32.7%</td><td>+19.3%</td><td>+98.1%</td></tr>
+        <tr><td>1y performance</td><td>+73.3%</td><td>+65.1%</td><td>+148.2%</td></tr>
+        <tr><td>Biggest near-term catalyst</td><td>Issuance cut (Mar 14, 2026) + Agile Coretime adoption</td><td>FIL vesting-end / Solstice reward shift + AI-storage demand</td><td>Privacy-coin narrative rotation + DASHCON momentum</td></tr>
+        <tr><td>Biggest near-term risk</td><td>Parachain demand failing to materialise post-2.0</td><td>AI-storage thesis failing to convert to paid onchain demand</td><td>Regulatory delistings of privacy coins</td></tr>
+        <tr><td>Liquidity tier</td><td>High (Binance, OKX, KuCoin, Bybit, Coinbase, Gate)</td><td>Medium-High (Binance, OKX, Coinbase, Gate, Bybit)</td><td>Medium (Binance, Azbit, Gate, MEXC, OKX; limited on Coinbase)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="outlook" class="compare">
+    <h2>Cross-asset outlook &amp; risks</h2>
+
+    <h3>Why all three are bouncing simultaneously</h3>
+    <p>All three tokens just printed new <em>cycle lows</em> in August 2026 (DOT at $0.727, FIL at $0.612, DASH in the low-$30s) before staging sharp recoveries. This is consistent with a broad altcoin rotation off the BTC/ETH base. Each has its own idiosyncratic narrative on top:</p>
+    <ul>
+      <li><strong>DOT</strong> — issuance cut + Polkadot 2.0 finally being the catalyst for real blockspace demand.</li>
+      <li><strong>FIL</strong> — AI-storage inflection + the FIL vesting-end / Solstice supply tightening.</li>
+      <li><strong>DASH</strong> — privacy-coin narrative rotation + tight float (max 18.9M).</li>
+    </ul>
+
+    <h3>What could break the thesis for each</h3>
+    <table>
+      <thead>
+        <tr><th>Asset</th><th>Tail risk</th><th>Probability lens</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>DOT</td><td>Agile Coretime fails to attract enough parachains → DOT burn revenue stays trivial → DOT remains a pure-inflation token.</td><td>Medium — tech works; adoption is the open question.</td></tr>
+        <tr><td>FIL</td><td>AI agents never meaningfully use decentralised storage; traditional hyperscalers absorb the demand; FIL supply never tightens in practice.</td><td>Medium-High — narrative-driven and dependent on external (AI) trends.</td></tr>
+        <tr><td>DASH</td><td>US/EU regulators force a wider delisting wave; Dash's payment UX loses ground to stablecoins and CBDCs.</td><td>Medium — structural, multi-year drag, but partially already priced in.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Common tail risks across all three</h3>
+    <div class="callout bad">
+      <ul>
+        <li><strong>Macro / liquidity regime.</strong> All three are high-beta to the broader altcoin cycle. A BTC-led risk-off move would hit them harder than majors.</li>
+        <li><strong>Exchange custody concentration.</strong> Liquidity is concentrated on a handful of CEXs; an exchange-specific event would move prices violently.</li>
+        <li><strong>Regulatory shocks.</strong> SEC vs CFTC token-classification questions are unresolved for all three in some form (DOT, DASH explicitly; FIL via the storage-as-a-service question).</li>
+        <li><strong>Historical drawdowns.</strong> All three are still 95–99% below their all-time highs — they have done this before, and can do it again.</li>
+      </ul>
+    </div>
+
+    <h3>Bottom-line read</h3>
+    <ul>
+      <li><strong>Polkadot</strong> is the most "fundamentals-driven" of the three right now — its 2026 story is about whether Polkadot 2.0 actually unlocks new demand for blockspace. The March 14, 2026 issuance cut is the cleanest single catalyst across the three.</li>
+      <li><strong>Filecoin</strong> is the highest-variance of the three — the AI-storage thesis is real but unproven, and the FIL vesting-end is a known supply-side catalyst that markets may or may not price correctly.</li>
+      <li><strong>Dash</strong> is the most narrative-driven — current strength is real (1y +148%, 30d +98%) but its ceiling is structurally limited by privacy-coin regulation. Tight supply and the privacy rotation give it asymmetric upside if the regulatory environment stays stable, but meaningful downside if it doesn't.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <p><strong>Methodology.</strong> Price, supply, market-cap, volume, rank, and historical levels are from <em>CoinGecko</em> and <em>CoinMarketCap</em> snapshot pages as of September 8, 2026. Technical architecture, history, and ecosystem details are from each project's official site, Wikipedia, and the Polkadot Wiki (wiki.polkadot.com). Recent news items and price-action commentary are sourced from CoinDesk and CoinMarketCap community feeds. Forward-looking forecasts are quoted verbatim from public aggregator pages (PrimeXBT, Crypto News, Coincub, Coinpedia, Coinbase, MSN/LiteFinance) for transparency — they are not the author's predictions.</p>
+    <p><strong>Disclaimer.</strong> This document is research, not financial advice. Cryptocurrency markets are volatile; past performance does not guarantee future returns. Always do your own due diligence.</p>
+  </footer>
+
+</div>
+</body>
+</html>
