@@ -16,6 +16,46 @@ bx type "#email" you@x.com --enter
 bx shot                       # → /home/you/.bx/shots/xxx.jpg
 ```
 
+## Big jobs (50+ results): follow this exactly
+
+"Find 200 Facebook groups that are X, with details, as a CSV" is five commands
+of yours, not fifty. The same shape fits any site.
+
+```bash
+# 1. one search per phrase; --pages scrolls the feed for you (never bx do scroll loops)
+bx open "https://www.facebook.com/groups/search/groups/?q=stock%20market%20pakistan"
+bx sift "a group for Pakistani retail investors, not a trading-signals, betting or spam group" --pages 5 --json > s1.json
+#    …repeat for each phrase (s2.json, s3.json …), then collect the kept hrefs into keep.txt with a short script
+# 2. a question the list cannot answer: every kept page at once
+bx check "the group is active and not full of spam posts" --file keep.txt
+# 3. values (members, posts, created): read only the keepers
+bx read --file keep.txt --max 2000 > about.txt
+```
+
+Rules that keep a big job from stalling:
+
+- **Filter before you read.** jev judging a list costs ~1.5s a page of 40.
+  Reading one Facebook page costs 5–14s. Reading 570 groups to keep 200 is
+  twenty minutes you did not need to spend.
+- **`read` and `check` with many URLs stop by themselves after 75s.** They print each
+  page as it finishes and write every result into a journal. If the last
+  line says `N left`, **run the exact same command again**: finished pages
+  are skipped and failed ones retried. Keep going until it says `complete`.
+  Never split the list into batch files, write a shell loop over it or add
+  `2>/dev/null`: that hides the `left` line.
+- The journal (path on the last line, `~/.bx/runs/*.jsonl`) holds one JSON
+  object per page (`url`, `title`, `text` or `answers`). Parse that file for your CSV,
+  not the terminal text.
+- **Never view a screenshot to find out what is on a page.** It took one model
+  95 seconds per image. `bx items`, `bx check "<q>"` and `bx check "<q>" --see`
+  answer in 1–3s.
+- Look at one page's text once (`bx read <one url> --max 3000`) before writing a
+  parser. Do not re-read the whole batch to discover its format.
+- Put the user's judgement words ("not spam", "Pakistani", "beginners") into
+  the `sift` or `check` criterion. Do not rebuild them as keyword lists in
+  Python: a keyword filter cannot tell a Pakistani group from one whose
+  search query happened to say "pakistan".
+
 ## Rule 0 — every decision you make about a page, try jev first
 
 Each of your own turns costs several seconds. A jev call costs about one. So
@@ -218,6 +258,11 @@ yes  100%  Investors Group Pakistan | Facebook                  tab 7.9s
 no   100%  Investment Opportunities in Pakistan for Salaried…   tab 7.2s
 8 of 10 yes · 10 pages in 15.3s · 6 at a time
 ```
+
+Pages print as they finish. After 75s (`--budget N` to change it, `--budget 0`
+for none) no new pages are started, and the last line says how many are left.
+Run the same command again to continue. Everything done so far is in the
+journal it names (`--out file.jsonl` to choose it, `--fresh` to start over).
 
 Every page is loaded at the same time in its own background tab, which is
 closed afterwards. Your tab and the user's tabs are never touched. For each

@@ -367,16 +367,47 @@ async function checkOne(url, list, b) {
 }
 
 // Many pages, one pool: `fn` per URL, at most `n` at a time, results in order.
-async function eachUrl(urls, n, fn) {
+// `budget` is how long a caller can afford to wait. Agent harnesses kill a
+// shell command after about two minutes, and a 570-page read killed at minute
+// two used to return nothing at all. So: stop starting pages at the deadline,
+// cap each page, and hand every page back the moment it is done (`onDone`),
+// so whatever finished is never lost.
+async function eachUrl(urls, n, fn, o = {}) {
   const out = new Array(urls.length);
+  const deadline = o.budget ? Date.now() + o.budget : Infinity;
+  const cap = o.perPage || 30000;
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(n, urls.length) }, async () => {
     while (next < urls.length) {
       const i = next++;
-      try { out[i] = await fn(urls[i]); } catch (e) { out[i] = { url: urls[i], error: String(e.message || e) }; }
+      if (Date.now() > deadline) { out[i] = { url: urls[i], skipped: true }; continue; }
+      let timer;
+      const late = new Promise((_, no) => { timer = setTimeout(() => no(new Error(`page took over ${Math.round(cap / 1000)}s`)), cap); });
+      try { out[i] = await Promise.race([fn(urls[i]), late]); } catch (e) { out[i] = { url: urls[i], error: String(e.message || e) }; }
+      finally { clearTimeout(timer); }
+      if (o.onDone) o.onDone(out[i]);
     }
   }));
   return out;
+}
+
+// /many/read and /jev/many share this: plain JSON at the end, or one NDJSON
+// line per page as it finishes when the caller streams.
+async function manyReply(res, b, urls, fn) {
+  const t0 = Date.now();
+  const pool = Math.max(1, Math.min(Number(b.parallel) || 6, 12));
+  const opts = { budget: Number(b.budget) || 0, perPage: Number(b.perPage) || 30000 };
+  const end = (out) => ({ ok: true, n: urls.length, done: out.filter((x) => x && !x.skipped).length,
+    skipped: out.filter((x) => x?.skipped).map((x) => x.url), ms: Date.now() - t0, parallel: pool });
+  if (!b.stream) {
+    const out = await eachUrl(urls, pool, fn, opts);
+    return send(res, 200, { ...end(out), results: out });
+  }
+  res.writeHead(200, { 'content-type': 'application/x-ndjson', 'cache-control': 'no-store' });
+  const line = (x) => { try { res.write(JSON.stringify(x) + '\n'); } catch {} };
+  const out = await eachUrl(urls, pool, fn, { ...opts, onDone: (x) => { if (!x.skipped) line({ t: 'page', ...x }); } });
+  line({ t: 'end', ...end(out) });
+  return res.end();
 }
 
 // ── batch executor ───────────────────────────────────────────────────────
@@ -703,10 +734,7 @@ const server = http.createServer(async (req, res) => {
       const list = b.questions ? [].concat(b.questions) : [b.question];
       if (!urls.length) throw new HttpError(400, 'many needs urls');
       if (!list[0]) throw new HttpError(400, 'many needs a question');
-      const t0 = Date.now();
-      const pool = Math.max(1, Math.min(Number(b.parallel) || 6, 12));
-      const out = await eachUrl(urls, pool, (u) => checkOne(u, list, b));
-      return send(res, 200, { ok: true, n: urls.length, results: out, ms: Date.now() - t0, parallel: pool });
+      return manyReply(res, b, urls, (u) => checkOne(u, list, b));
     }
 
     // The text of many pages at once, for when the answer is a value rather
@@ -717,14 +745,11 @@ const server = http.createServer(async (req, res) => {
       const b = await body(req);
       const urls = [...new Set((b.urls || []).map(String).filter((u) => /^https?:\/\//i.test(u)))];
       if (!urls.length) throw new HttpError(400, 'read needs urls');
-      const t0 = Date.now();
-      const pool = Math.max(1, Math.min(Number(b.parallel) || 6, 12));
-      const out = await eachUrl(urls, pool, async (u) => {
+      return manyReply(res, b, urls, async (u) => {
         const t1 = Date.now();
         const g = await grab(u, b, { mode: b.mode || 'md', max: b.max || 4000 });
-        try { return { url: g.url, title: g.title, via: g.via, text: g.text, ms: Date.now() - t1 }; } finally { await g.done(); }
+        try { return { url: g.url, asked: u, title: g.title, via: g.via, text: g.text, ms: Date.now() - t1 }; } finally { await g.done(); }
       });
-      return send(res, 200, { ok: true, n: urls.length, results: out, ms: Date.now() - t0, parallel: pool });
     }
 
     // ── agent: the whole loop ────────────────────────────────────────────

@@ -122,7 +122,7 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a.startsWith('--')) {
     const [k, v] = a.slice(2).split('=');
-    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file'].includes(k) ? argv[++i] : true) : v;
+    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out'].includes(k) ? argv[++i] : true) : v;
   } else args.push(a);
 }
 const num = (v) => (v === undefined ? undefined : Number(v));
@@ -161,6 +161,11 @@ function nudge(out) {
     if (host && trail.filter((x) => x.host === host).length >= 3) {
       return `jev: opening ${host} pages one by one — ${bold('bx check "<question>" <url> <url> …')} or ${bold('bx read <url> <url> …')} does them all at once in background tabs`;
     }
+  }
+  // Scroll, sleep, scroll, sleep, then items: the Facebook run did that 18
+  // times by hand. --pages already scrolls a feed and waits for the new rows.
+  if (rs.filter((r) => r.a === 'scroll').length >= 2) {
+    return `jev: no need to scroll a feed by hand — ${bold('bx items --pages 5')} scrolls and collects in one call, ${bold('bx sift "<criterion>" --pages 5')} also keeps only the ones that fit`;
   }
   if (rs.some((r) => r.a === 'shot')) {
     return `jev: to answer a question about how the page looks, ${bold('bx check "<question>" --see')} is one ~3s call instead of reading the image yourself`;
@@ -384,6 +389,68 @@ const target = (i = 0) => {
   return t;
 };
 
+
+// ── many pages: time-boxed, streamed, resumable ─────────────────────────
+// The run this replaces: 570 Facebook groups read in batches of 50, each batch
+// silent until its last page, and the agent's shell killing any command past
+// 120s — so a batch either finished or vanished, and one hung tab stalled the
+// session until the user asked why it was stuck. Now each page prints the
+// moment it lands, goes into a journal on disk, and the call stops starting
+// pages after --budget seconds (default 75). Running the same command again
+// skips everything already in the journal, so "continue" is just "again".
+function journalFor(kind, key, urls) {
+  const h = require('crypto').createHash('sha1').update(`${kind}\n${key}\n${[...urls].sort().join('\n')}`).digest('hex').slice(0, 12);
+  return flags.out ? path.resolve(flags.out) : path.join(HOME, 'runs', `${kind}-${h}.jsonl`);
+}
+
+async function manyUrls(kind, route, key, urls, payload, show) {
+  urls = [...new Set(urls)];
+  const file = journalFor(kind, key, urls);
+  const prior = new Map();
+  if (!flags.fresh) {
+    try {
+      for (const l of fs.readFileSync(file, 'utf8').split('\n')) {
+        if (!l.trim()) continue;
+        try { const x = JSON.parse(l); if (!x.error) prior.set(x.asked || x.url, x); } catch {}
+      }
+    } catch {}
+  }
+  const todo = urls.filter((u) => !prior.has(u));
+  const budget = flags.budget === undefined ? 75 : Number(flags.budget);
+  const par = Math.max(1, Math.min(num(flags.parallel) || 6, 12));
+  try { fs.mkdirSync(path.dirname(file), { recursive: true }); } catch {}
+  if (prior.size && !flags.json) console.log(dim(`resuming · ${prior.size} of ${urls.length} already done, in ${file}`));
+  if (!todo.length) {
+    if (flags.json) { console.log(JSON.stringify({ ok: true, n: urls.length, journal: file, results: urls.map((u) => prior.get(u)) }, null, 2)); return 0; }
+    console.log(`${OK} all ${urls.length} pages already done ${dim(`— results in ${file}  (--fresh to redo)`)}`);
+    return 0;
+  }
+  if (!flags.json) {
+    const est = Math.round((todo.length / par) * 8);   // Facebook tabs measured at 5–14s each
+    console.log(dim(`${todo.length} pages · ${par} at a time · ~${est}s${budget && est > budget ? ` · this call stops at ${budget}s, run it again to continue` : ''}`));
+  }
+  const fresh = [];
+  const end = await stream(route, { ...payload, urls: todo, parallel: par, budget: budget ? budget * 1000 : 0, stream: true }, (x) => {
+    delete x.t;
+    fresh.push(x);
+    try { fs.appendFileSync(file, JSON.stringify(x) + '\n'); } catch {}
+    if (!flags.json) show(x);
+  });
+  if (end.ok === false && end.error) die(end.error);
+  const errs = fresh.filter((x) => x.error).length;
+  const left = end.skipped?.length || 0;
+  const all = new Map([...prior, ...fresh.filter((x) => !x.error).map((x) => [x.asked || x.url, x])]);
+  if (flags.json) {
+    console.log(JSON.stringify({ ok: true, n: urls.length, done: all.size, left, errors: errs, journal: file,
+      results: urls.map((u) => all.get(u) || fresh.find((x) => (x.asked || x.url) === u) || { url: u, skipped: true }) }, null, 2));
+  } else {
+    console.log(dim(`\n${fresh.length - errs} pages in ${secs(end.ms || 0)} · ${par} at a time${errs ? ` · ${errs} failed` : ''} · ${all.size}/${urls.length} done · journal ${file}`));
+    if (left || errs) console.log(`  ${mag('▸')} ${bold(`${left + errs} left`)} ${dim('— run the exact same command again; finished pages are skipped, failed ones retried')}`);
+    else if (prior.size) console.log(`  ${mag('▸')} ${dim(`complete — earlier pages are in the journal, one JSON object per line`)}`);
+  }
+  return left || errs ? 3 : 0;
+}
+
 async function main() {
   const cmd = args.shift();
   switch (cmd) {
@@ -546,18 +613,15 @@ async function main() {
       if (urls.length) {
         const q = args.filter((x) => !/^https?:\/\//i.test(x)).join(' ');
         if (!q) die(`check needs a question — ${bold('bx check "has an Anonymous post option" <url> <url> ...')}`);
-        const r = await api('POST', '/jev/many', { question: q, urls, parallel: num(flags.parallel), see: see(), fetch: flags['no-fetch'] ? false : undefined });
-        if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
-        if (!r.ok) die(r.error || 'check failed');
         let yes = 0;
-        for (const x of r.results) {
-          if (x.error) { console.log(`${red('err')}  ${trunc(x.url, 70)}  ${dim(trunc(x.error, 60))}`); continue; }
+        const code = await manyUrls('check', '/jev/many', q, urls, { question: q, see: see(), fetch: flags['no-fetch'] ? false : undefined }, (x) => {
+          if (x.error) { console.log(`${red('err')}  ${trunc(x.url, 70)}  ${dim(trunc(x.error, 60))}`); return; }
           const a = x.answers[0];
           if (a.answer) yes++;
           console.log(`${a.answer ? grn('yes') : red('no ')}  ${pct(a.answer ? a.p : 1 - (a.p ?? 0))}  ${trunc(x.title || x.url, 58).padEnd(58)} ${dim(`${x.via} ${secs(x.ms)}`)}${eye(x)}\n     ${dim(x.url)}`);
-        }
-        console.log(dim(`${yes} of ${r.n} yes · ${r.n} pages in ${secs(r.ms)} · ${r.parallel} at a time`));
-        return;
+        });
+        if (!flags.json && yes) console.log(dim(`${yes} yes in this call`));
+        process.exit(code);
       }
       const q = args.join(' ');
       if (!q) die(`check needs a question — ${bold('bx check "am I logged in"')}`);
@@ -706,16 +770,13 @@ async function main() {
       const urls = args.filter((x) => /^https?:\/\//i.test(x));
       if (flags.file) urls.push(...fs.readFileSync(flags.file, 'utf8').split(/\s+/).filter((x) => /^https?:\/\//i.test(x)));
       if (urls.length) {
-        const r = await api('POST', '/many/read', { urls, mode: flags.mode, max: num(flags.max), parallel: num(flags.parallel), fetch: flags['no-fetch'] ? false : undefined });
-        if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
-        if (!r.ok) die(r.error || 'read failed');
-        for (const x of r.results) {
-          if (x.error) { console.log(`\n${red('═══ err')} ${x.url}  ${dim(trunc(x.error, 60))}`); continue; }
+        if (urls.length > 40 && !flags.json) console.log(`  ${mag('▸')} ${dim(`jev: ${urls.length} pages is a lot to read — if you are going to keep only some, ${bold('bx sift "<criterion>" --pages N')} on the results list first, or ${bold('bx check "<question>" --file F')}, and read just the keepers`)}`);
+        const code = await manyUrls('read', '/many/read', `${flags.mode || 'md'}|${flags.max || ''}`, urls, { mode: flags.mode, max: num(flags.max), fetch: flags['no-fetch'] ? false : undefined }, (x) => {
+          if (x.error) { console.log(`\n${red('═══ err')} ${x.url}  ${dim(trunc(x.error, 60))}`); return; }
           console.log(`\n${bold('═══')} ${bold(trunc(x.title || '', 70))}  ${dim(`${x.via} ${secs(x.ms)}`)}\n${dim(x.url)}\n`);
           console.log(x.text);
-        }
-        console.log(dim(`\n${r.n} pages in ${secs(r.ms)} · ${r.parallel} at a time`));
-        return;
+        });
+        process.exit(code);
       }
       return settled([{ a: 'read', target: target(), mode: flags.mode, max: num(flags.max) }]);
     }
