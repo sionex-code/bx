@@ -742,7 +742,12 @@ async function unsent(actions, out) {
   });
   const p = PENDING.get(out.tab);
   if (!p || Date.now() - p.at > 5 * 60000) { PENDING.delete(out.tab); return; }
-  const sent = rs.some((r, i) => r.ok && i > typedAt && actions[i] && (actions[i].a === 'click' || actions[i].a === 'send' || (actions[i].a === 'press' && /enter/i.test([].concat(actions[i].keys || actions[i].key).join(' '))))) ||
+  // Only a click on something that reads like a send button counts. Clicking
+  // "Add flair and tags" or "View all flairs" with a post typed in the box is
+  // not a failed send, and warning about it — after 2s of re-checking — made
+  // the Reddit run doubt clicks that had worked.
+  const sendish = (r, a) => a.a !== 'click' || (/\b(post|send|comment|reply|submit|publish|share|tweet|update|save)\b/i.test(`${(r.r && r.r.name) || ''} ${typeof a.target === 'string' ? a.target : ''}`) && !/\b(field|box|input|body|text\s*area)\b/i.test((r.r && r.r.name) || ''));
+  const sent = rs.some((r, i) => r.ok && i > typedAt && actions[i] && sendish(r, actions[i]) && (actions[i].a === 'click' || actions[i].a === 'send' || (actions[i].a === 'press' && /enter/i.test([].concat(actions[i].keys || actions[i].key).join(' '))))) ||
     rs.some((r, i) => r.ok && actions[i] && actions[i].a === 'type' && actions[i].enter);
   if (!sent) return;
   // A real submit clears the box, sometimes only after a network round trip.

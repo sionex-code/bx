@@ -488,6 +488,14 @@ document has no match.
 - `covered` on a click means an overlay intercepted it. Dismiss the banner or
   modal and click again.
 - A batch stops at the first failure unless you pass `"stopOnError":false`.
+- Never `cat ~/.bx/config.json`: it holds the user's jev API key and would put
+  it in your transcript. `bx status` and `bx jev` show what you need.
+- Need a link to the user's own project? Take it from the repo you are in
+  (`git remote -v`), don't guess it. A run guessed three wrong GitHub URLs.
+- Sites built from web components (Reddit's post form and flair dialog) keep
+  their buttons inside shadow roots. `bx els`, `text=` targets and CSS targets
+  see into them; do not fall back to `bx eval` digging. If a box is ambiguous
+  bx says which refs match: pick one with `ref=eN`.
 - Quote every URL. zsh treats `(`, `)`, `?` and `*` as glob characters, so
   `bx open https://en.wikipedia.org/wiki/Jal_(band)` fails before bx even
   runs. Write `bx open "https://…/Jal_(band)"`.

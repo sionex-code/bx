@@ -237,7 +237,11 @@ const fieldName = (el) => (el.getAttribute('aria-label') || el.getAttribute('pla
 const draftMark = (el, t) => `[unsent text in "${fieldName(el)}": ${t.replace(/\s+/g, ' ').trim().slice(0, 300)}]`;
 BX.drafts = (root = document) => {
   const out = [];
-  for (const el of root.querySelectorAll('[contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"], textarea, input:not([type]), input[type=text], input[type=search]')) {
+  // Inside shadow roots too: Reddit's Title box lives in one, and a box the
+  // check cannot see reads as "the text left it", i.e. sent.
+  const roots = root === document ? BX.roots() : [root];
+  const boxes = roots.flatMap((r) => [...r.querySelectorAll('[contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"], textarea, input:not([type]), input[type=text], input[type=search]')]);
+  for (const el of boxes) {
     if (el.tagName !== 'TEXTAREA' && el.tagName !== 'INPUT' && !editRoot(el)) continue;
     const t = (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' ? el.value : el.innerText) || '';
     if (!t.trim() || !BX.visible(el)) continue;
@@ -331,7 +335,7 @@ A.elements = async (a) => {
   let scanned = 0;
   const skip = a.skip ? BX.qsa(a.skip)[0] : null;
   const inside = a.in ? await BX.want(a.in, { timeout: a.timeout ?? 3000 }) : null;
-  for (const el of BX.qsa(sel)) {
+  for (const el of BX.qsa(sel, true)) {
     if (++scanned > 6000) break;   // pathological page — report what we have
     if (seen.has(el) || !BX.visible(el) || (skip && skip.contains(el)) || (inside && !inside.contains(el))) continue;
     seen.add(el);
