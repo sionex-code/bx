@@ -276,6 +276,27 @@ A.read = async (a) => {
   let text;
   if (mode === 'html') text = a.outer ? el.outerHTML : el.innerHTML;
   else if (mode === 'text') text = el.innerText || el.textContent || '';
+  // What is on screen right now, in reading order: the text nodes whose box
+  // is inside the viewport. An agent deciding what to do next wants this, not
+  // the first few thousand characters of the document, which on most sites
+  // are the header menus (jev-ultrafast reads the page the same way).
+  else if (mode === 'view') {
+    const out = [], range = document.createRange(), cap = a.max || 6000;
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let n, len = 0;
+    while ((n = w.nextNode()) && len < cap) {
+      const v = n.textContent.replace(/\s+/g, ' ').trim(), p = n.parentElement;
+      if (!v || !p || p.closest('script,style,noscript,template,[aria-hidden="true"]')) continue;
+      range.selectNodeContents(n);
+      const r = range.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth)) continue;
+      // Keep the two cues a reader uses to find what a block is about:
+      // bold names its subject, a caption only labels the picture.
+      const t = p.closest('figcaption,[class*="caption"]') ? `[picture caption: ${v}]` : p.closest('b,strong') ? `**${v}**` : v;
+      out.push(t); len += t.length + 1;
+    }
+    text = out.join('\n');
+  }
   else if (mode === 'links') {
     return { links: BX.qsa('a[href]').filter(BX.visible).slice(0, a.max || 300).map((x) => ({ text: x.innerText.replace(/\s+/g, ' ').trim().slice(0, 80), href: x.href })) };
   } else text = toMd(el);
@@ -326,7 +347,14 @@ A.elements = async (a) => {
       // Where the link actually goes. An agent cannot tell a link it has
       // already followed from a fresh one without it, nor a real link from a
       // footnote marker that only scrolls the page it is already on.
-      href: typeof el.href === 'string' ? el.href : undefined
+      href: typeof el.href === 'string' ? el.href : undefined,
+      // How the page presents it. A summary block names its subject in bold
+      // and puts a captioned picture next to it; as bare link names the two
+      // look alike — Wikipedia's featured-article caption beat the article.
+      sec: BX.section(el),
+      look: el.closest('figcaption,[class*="caption"]') ? 'image caption'
+        : el.tagName === 'A' && !el.innerText.trim() && el.querySelector('img,svg') ? 'image'
+        : el.closest('b,strong,h1,h2,h3') ? 'bold' : undefined
     } : BX.describe(el));
     if (out.length >= (a.max || 150)) break;
   }

@@ -463,6 +463,38 @@ W.nav = async (tabId, a) => {
   return { url: t.url, title: t.title, status: t.status };
 };
 
+// What did the last input set off? Wait a short grace for a navigation (or a
+// same-document URL change) to start; if one does, wait for it to load, and
+// if none does, return as soon as the grace is up. A flat sleep either wastes
+// the whole wait on a click that changes nothing, or ends before a slow
+// submit has begun and the next read sees the page that is about to vanish.
+W.after = async (tabId, a) => {
+  const t0 = Date.now();
+  const tab = await chrome.tabs.get(tabId);
+  let moved = tab.status === 'loading' ? 'loading' : a.from && tab.url !== a.from ? 'url' : null;
+  if (!moved) {
+    moved = await new Promise((res) => {
+      const off = (v) => {
+        clearTimeout(to);
+        chrome.webNavigation.onBeforeNavigate.removeListener(nav);
+        chrome.webNavigation.onHistoryStateUpdated.removeListener(hist);
+        chrome.tabs.onUpdated.removeListener(upd);
+        res(v);
+      };
+      const nav = (d) => { if (d.tabId === tabId && d.frameId === 0) off('navigate'); };
+      const hist = (d) => { if (d.tabId === tabId && d.frameId === 0) off('history'); };
+      const upd = (id, ch) => { if (id === tabId && (ch.status === 'loading' || ch.url)) off('loading'); };
+      const to = setTimeout(() => off(null), a.ms ?? 250);
+      chrome.webNavigation.onBeforeNavigate.addListener(nav);
+      chrome.webNavigation.onHistoryStateUpdated.addListener(hist);
+      chrome.tabs.onUpdated.addListener(upd);
+    });
+  }
+  if (moved && moved !== 'history') await waitForLoad(tabId, a.timeout ?? 8000).catch(() => {});
+  const t = await chrome.tabs.get(tabId);
+  return { url: t.url, moved, waited: Date.now() - t0 };
+};
+
 W.back = async (tabId, a) => { loadErr.delete(tabId); await chrome.tabs.goBack(tabId); if (a.wait !== false) await waitForLoad(tabId, 15000); await landed(tabId, a); const t = await chrome.tabs.get(tabId); return { url: t.url }; };
 W.forward = async (tabId, a) => { loadErr.delete(tabId); await chrome.tabs.goForward(tabId); if (a.wait !== false) await waitForLoad(tabId, 15000); await landed(tabId, a); const t = await chrome.tabs.get(tabId); return { url: t.url }; };
 W.reload = async (tabId, a) => { loadErr.delete(tabId); await chrome.tabs.reload(tabId, { bypassCache: !!a.hard }); if (a.wait !== false) await waitForLoad(tabId, 20000); await landed(tabId, a); const t = await chrome.tabs.get(tabId); return { url: t.url }; };
@@ -589,6 +621,26 @@ async function exec(tabId, a, cfg, batch) {
   if (trusted && (a.a === 'click' || a.a === 'dblclick')) {
     const box = await toContent(tabId, { a: 'box', target: a.target, in: a.in, timeout: a.timeout }, cfg);
     return cdpClick(tabId, box.x + box.w / 2, box.y + box.h / 2, a.button === 'right' ? 'right' : 'left', a.a === 'dblclick' ? 2 : (a.clicks || 1));
+  }
+  if (trusted && a.a === 'type' && a.bulk) {
+    // The whole value in one trusted insert, the way jev-ultrafast types:
+    // focus, select what the field holds, replace it. Per-character input
+    // races widgets that re-render as you type — Wikipedia's search box
+    // submitted "Ala" for "Alan Turing" — and one insert cannot be raced.
+    await toContent(tabId, { a: 'click', target: a.target, in: a.in, speed: 'instant' }, cfg);
+    const r = await withCdp(tabId, async (t) => {
+      if (a.clear !== false) {
+        await cdp(t, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2, commands: ['selectAll'] });
+        await cdp(t, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2 });
+      }
+      await cdp(t, 'Input.insertText', { text: String(a.text ?? '') });
+      if (a.enter) {
+        await cdp(t, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
+        await cdp(t, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+      }
+      return { trusted: true, bulk: true, len: String(a.text ?? '').length };
+    });
+    return r;
   }
   if (trusted && a.a === 'type') {
     await toContent(tabId, { a: 'click', target: a.target, in: a.in, speed: a.speed }, cfg);
