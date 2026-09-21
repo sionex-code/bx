@@ -228,6 +228,7 @@ function render(out) {
   }
   if ((out.results || []).length > 1) console.log(dim(`${DOT} ${out.results.length} actions in ${out.ms}ms  tab ${out.tab}`));
   for (const w of out.warnings || []) console.log(`\n  ${red('▲ not sent:')} ${yel(w)}`);
+  if (out.sent) console.log(`  ${OK} ${grn('sent')} ${dim(`— the typed text left "${out.sent}", no need to check again`)}`);
   if (out.memory) {
     // The briefing is worth reading once. Reprinted on every failure it was
     // 40k characters of the same lines in one LinkedIn run — context an agent
@@ -397,7 +398,7 @@ const run = async (actions) => process.exit(render(await api('POST', '/do', { ..
 // not. --no-wait skips it.
 const settled = async (actions) => {
   if (flags['no-wait']) return run(actions);
-  const out = await api('POST', '/do', { ...common(), actions: [{ a: 'wait', settle: true, timeout: 4000 }, ...actions] });
+  const out = await api('POST', '/do', { ...common(), actions: [{ a: 'wait', settle: true, timeout: 4000 }, ...scoped(actions)] });
   // Drop the wait only when it worked. A failed one is the whole answer —
   // an error page, a dead tab — and hiding it printed nothing at all.
   if (out.results && out.results[0]?.a === 'wait' && (out.results[0].ok || out.results.length > 1)) out.results.shift();
@@ -439,7 +440,8 @@ ${bold('act')}
   click <target>              ${dim('--trusted --speed human|fast|instant')}
                               ${dim('--has TEXT --near SEL --nth N  narrow an over-matching target')}
   dblclick|rclick|hover <target>
-  type <target> <text>        ${dim('--enter --noclear --trusted')}
+  type <target> <text>        ${dim('--enter --noclear --trusted --send (press the send button next to it and confirm)')}
+  send [box]                  press the send button next to a text box
   fill <sel=value>...         ${dim('--fast')}
   press <keys>                ${dim('e.g. Enter, ctrl+a, ArrowDown')}
   select <target> <value>
@@ -820,12 +822,13 @@ async function main() {
       const r = await api('POST', '/jev/sift', { criterion, tab: common().tab, max: num(flags.max), target: flags.target, pages: num(flags.pages), all: !!flags.all, chars: num(flags.chars), see: see() });
       if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
       if (!r.ok) die(r.error || 'sift failed');
+      if (r.unjudged) console.log(`${yel('▲ jev could not judge')} ${dim(`(${trunc(r.unjudged, 70)}) — rows marked ?? are unjudged: decide those yourself from their text, do not wait and retry`)}`);
       console.log(dim(`${r.kept} of ${r.n} kept${r.pages > 1 ? ` across ${r.pages} pages` : ''} · ${secs(r.ms)}`) + eye(r));
       for (const it of r.items) {
-        const mark = it.keep ? grn('keep') : dim('drop');
-        console.log(`${mark} ${pct(it.keep ? it.p : 1 - (it.p ?? 0))}  ${yel(`${r.pages > 1 ? `p${it.page}·` : ''}${it.i}`.padStart(2))}  ${trunc(it.text, 130)}${it.href ? `\n                ${dim(it.href)}` : ''}`);
+        const mark = it.keep === null ? yel('?? ') + ' ' : it.keep ? grn('keep') : dim('drop');
+        console.log(`${mark} ${it.keep === null ? dim('  --') : pct(it.keep ? it.p : 1 - (it.p ?? 0))}  ${yel(`${r.pages > 1 ? `p${it.page}·` : ''}${it.i}`.padStart(2))}  ${trunc(it.text, 130)}${it.href ? `\n                ${dim(it.href)}` : ''}`);
       }
-      process.exit(r.kept ? 0 : 1);
+      process.exit(r.kept || r.unjudged ? 0 : 1);
     }
 
     case 'jev': {
@@ -900,7 +903,13 @@ async function main() {
       process.exit(code);
     }
 
-    case 'type': return run([{ a: 'type', target: target(), text: args.slice(1).join(' '), enter: !!flags.enter, clear: flags.noclear ? false : undefined }]);
+    case 'type': return run([
+      { a: 'type', target: target(), text: args.slice(1).join(' '), enter: !!flags.enter, clear: flags.noclear ? false : undefined },
+      // --send: press the send button next to the box, and the bridge checks
+      // the text actually left it.
+      ...(flags.send ? [{ a: 'send', target: target() }] : [])
+    ]);
+    case 'send': return run([{ a: 'send', target: args[0] ? target() : undefined }]);
     case 'clear': return run([{ a: 'clear', target: target() }]);
     case 'press': return run([{ a: 'press', keys: args, target: flags.target }]);
     case 'select': return run([{ a: 'select', target: target(), value: args.slice(1).join(' ') }]);
@@ -916,7 +925,12 @@ async function main() {
     case 'scroll': {
       const to = args[0];
       const a = { a: 'scroll', target: flags.target };
+      // "bx scroll 3" means three screens to everyone who types it; it used
+      // to mean "to pixel 3". Small numbers are screens (negative: up),
+      // `down`/`up` [N] too; a big number is still a pixel position.
       if (to === 'bottom' || to === 'top') a.to = to;
+      else if (to === 'down' || to === 'up') a.screens = (num(args[1]) || 1) * (to === 'up' ? -1 : 1);
+      else if (to !== undefined && !isNaN(+to) && Math.abs(+to) < 100) a.screens = +to;
       else if (to !== undefined && !isNaN(+to)) a.to = +to;
       if (flags.by) a.by = [0, num(flags.by)];
       if (flags.into) a.into = true;
@@ -927,7 +941,10 @@ async function main() {
 
     case 'wait': {
       const a = { a: 'wait' };
+      // "bx wait 1500" and "bx wait ms=1500" are how people write a pause.
+      const bare = /^(?:ms=)?(\d+)$/.exec(args[0] || '');
       if (flags.ms) a.ms = num(flags.ms);
+      else if (bare && !flags.gone && !flags.text) a.ms = +bare[1];
       else if (flags.gone) a.gone = typeof flags.gone === 'string' ? flags.gone : target();
       else if (flags.text) a.text = flags.text;
       else if (flags.load) a.load = true;

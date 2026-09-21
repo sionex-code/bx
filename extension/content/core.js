@@ -88,7 +88,12 @@ BX.heal = (k) => {
 BX.visible = (el) => {
   if (!el || el.nodeType !== 1 || !el.isConnected) return false;
   if (el.checkVisibility) {
-    if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true })) return false;
+    if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true })) {
+      // A display:contents wrapper has no box of its own but shows its
+      // children. LinkedIn wraps each search result in one, so the ref bx
+      // items handed out for a row could never be targeted.
+      return getComputedStyle(el).display === 'contents' && [...el.children].some(BX.visible);
+    }
     const r = el.getBoundingClientRect();
     if (r.width < 1 || r.height < 1) return false;
     return !el.closest('[inert]');

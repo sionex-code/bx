@@ -286,13 +286,20 @@ async function judge(b, page) {
   const answers = {};
   const chunks = [];
   for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+  // jev down (overloaded for a minute and a half on one run) used to fail the
+  // whole sift, and the agent slept and retried with nothing to show. The
+  // list itself is still worth having: hand it back unjudged.
+  let down = null;
   await Promise.all(chunks.map(async (chunk) => {
     const part = {};
     for (const x of chunk) part[`i${x.i}`] = qs[`i${x.i}`];
-    const out = await jev.ask(st, part, CFG.jev, { sequential: false, images: img ? [img] : undefined });
-    Object.assign(answers, out.answers);
+    try {
+      const out = await jev.ask(st, part, CFG.jev, { sequential: false, images: img ? [img] : undefined });
+      Object.assign(answers, out.answers);
+    } catch (e) { down = String(e.message || e); }
   }));
   return items.map((x) => {
+    if (!answers[`i${x.i}`]) return { ...x, keep: null, unjudged: down || 'no answer', saw: !!img };
     const a = jev.read(answers[`i${x.i}`]);
     return { ...x, keep: !!a.value, p: a.p, saw: !!img };
   });
@@ -729,11 +736,11 @@ async function unsent(actions, out) {
   let typedAt = -1;
   rs.forEach((r, i) => {
     const a = actions[i];
-    if (r.ok && a && a.a === 'type' && squash(a.text).length >= 8) { PENDING.set(out.tab, { text: squash(a.text).slice(0, 40), at: Date.now() }); typedAt = i; }
+    if (r.ok && a && a.a === 'type' && squash(a.text).length >= 8) { PENDING.set(out.tab, { text: squash(a.text).slice(0, 40), at: Date.now(), label: r.r && r.r.name }); typedAt = i; }
   });
   const p = PENDING.get(out.tab);
   if (!p || Date.now() - p.at > 5 * 60000) { PENDING.delete(out.tab); return; }
-  const sent = rs.some((r, i) => r.ok && i > typedAt && actions[i] && (actions[i].a === 'click' || (actions[i].a === 'press' && /enter/i.test([].concat(actions[i].keys || actions[i].key).join(' '))))) ||
+  const sent = rs.some((r, i) => r.ok && i > typedAt && actions[i] && (actions[i].a === 'click' || actions[i].a === 'send' || (actions[i].a === 'press' && /enter/i.test([].concat(actions[i].keys || actions[i].key).join(' '))))) ||
     rs.some((r, i) => r.ok && actions[i] && actions[i].a === 'type' && actions[i].enter);
   if (!sent) return;
   // A real submit clears the box, sometimes only after a network round trip.
@@ -741,7 +748,7 @@ async function unsent(actions, out) {
     if (tries) await new Promise((ok) => setTimeout(ok, 500));
     const d = await call({ t: 'run', tab: out.tab, actions: [{ a: 'drafts' }], timeout: 3000, stopOnError: true, speed: 'instant', trusted: false }, 6000);
     const still = (d.results?.[0]?.r?.drafts || []).find((x) => squash(x.text).includes(p.text));
-    if (!still) { PENDING.delete(out.tab); return; }
+    if (!still) { out.sent = p.label || 'the text box'; PENDING.delete(out.tab); return; }
     if (tries === 4) {
       (out.warnings = out.warnings || []).push(`the text you typed is still in "${still.label}" (${still.ref}) after that click — it was NOT sent. The click hit something else; find the real send button inside the same item (bx els --in <item ref>): it may say Comment, Send or Reply rather than Post.`);
     }
@@ -981,8 +988,13 @@ const server = http.createServer(async (req, res) => {
       const judged = (await Promise.all(judging)).flat();
       if (!judged.length) return send(res, 200, { ok: false, error: 'no repeated list found on this page — try `bx items <css of the list>`' });
       const kept = judged.filter((x) => x.keep).sort((x, y) => (y.p ?? 0) - (x.p ?? 0));
+      const unjudged = judged.filter((x) => x.keep === null);
+      if (unjudged.length && unjudged.length === judged.length) {
+        return send(res, 200, { ok: true, unjudged: unjudged[0].unjudged, criterion: b.criterion, pages: pages.length || 1,
+          url: pages[0]?.url || b.url, title: pages[0]?.title || b.title, n: judged.length, kept: 0, items: judged, ms: Date.now() - t0 });
+      }
       return send(res, 200, {
-        ok: true, criterion: b.criterion, pages: pages.length || 1,
+        ok: true, criterion: b.criterion, pages: pages.length || 1, ...(unjudged.length ? { unjudged: `${unjudged.length} items: ${unjudged[0].unjudged}` } : {}),
         url: pages[0]?.url || b.url, title: pages[0]?.title || b.title,
         n: judged.length, kept: kept.length,
         items: b.all ? judged : kept, ms: Date.now() - t0, model: CFG.jev.model, saw: judged.some((x) => x.saw)
