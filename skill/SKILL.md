@@ -1,6 +1,6 @@
 ---
 name: bx
-description: Drive a real Chrome browser — navigate, click, type, fill forms, upload files, scroll, screenshot, switch tabs, read pages. Its fast model jev replaces most of your own per-page reasoning — bx agent clicks through to a goal, bx sift judges a whole result list across pages in seconds, bx check answers a yes/no about one page or many pages at once, bx read <urls> pulls many pages in parallel; prefer those to opening, reading and screenshotting pages yourself one by one. Use when a task needs a logged-in browser, a JS-rendered page, a form submitted, a file uploaded, results collected from a site, or a screenshot of real UI. Trigger: /bx, "use the browser", "in Chrome", "fill this form", "upload to", "screenshot the page", "find X on <site>".
+description: Drive the user's real, logged-in Chrome from the shell — open pages, click, type, fill forms, upload files, scroll, screenshot, read pages, list a page's links. Use it for real tasks on real sites: posting or commenting in LinkedIn/Facebook groups, researching many groups or a YouTube niche, filling and submitting forms, collecting results to CSV, walking links between pages. It is fast because jev, a small fast model, makes the small decisions (~1s each) so you only plan and write — `bx sift` filters a whole result list, `bx check` answers yes/no about many pages at once, `bx read <urls>` reads many pages in parallel, `bx each` repeats an action over a list, `bx agent` clicks through a known flow. Prefer these over opening, reading and screenshotting pages one by one. jev cannot plan a multi-step route; you plan it and bx clicks. Trigger: /bx, "use the browser", "in Chrome", "fill this form", "upload to", "screenshot the page", "find X on <site>", "post in the group", "research these groups".
 ---
 
 # bx — browser control
@@ -71,6 +71,7 @@ about to decide is one of these, and if it is, hand it over:
 | confirm something about the page (did it save, am I logged in) | `bx check "<question>"` | one call |
 | ask the same thing about several pages (which of these groups allow X) | `bx check "<question>" <url> <url> …` | all pages at once, ~15s for 10 |
 | get values off several pages (member count, price, contact of each) | `bx read <url> <url> … --max 1500` | all pages at once, ~7s for 4 |
+| find a route of links from page A to page B (wiki-walk, "how do I get from X to Y") | out-links of A × pages linking to B — see *Link routes* | two reads, ~10s |
 
 **Never take a screenshot to see what a click did.** `bx click` reports it:
 the new URL if the page moved, and every element that appeared (a dropdown's
@@ -96,6 +97,7 @@ Almost every browser task is some mix of these. Match the part you are on:
 | "…which of them has / allows / shows Y" | a yes/no per item | `bx check "<Y>" <url> …` on all of them at once |
 | "…and tell me the Z of each" | a value per item | `bx read <url> … --max 1500`, then read off Z |
 | "is the page / button / modal …" (how it looks) | visual | `bx check "<question>" --see` |
+| "get from page A to page B link by link", "what connects X and Y" | a search over links | *Link routes* below: never guess bridges from memory |
 | "do X to each of them" (reply, accept, message, fill) | an action per item | `bx each` — one command for the whole list, see below |
 | "comment on / like posts in the feed" | one item among many identical ones | `bx items --chars 2000`, then `bx do --in ref=eN '[…]'` per post |
 | "post / apply / submit on each of these pages" | the same flow on page after page | do it by hand on two pages; bx saves it; then `bx recipe <name> <url> 'text=…'` per page |
@@ -267,6 +269,62 @@ left`, run the same command again. A page bx could not read answers `??
 unknown`, never `no`. Opening a page is a visit (an inbox thread is marked
 read). Details: REFERENCE.md.
 
+### Link routes (wiki-walks, "how does A connect to B")
+
+Finding a path of links between two pages is a search, not a puzzle to
+solve in your head. One run spent 2½ minutes guessing bridges from memory
+(Alan Walker → Faded → Sony Music → T-Series …), opened 11 pages, and never
+arrived. Two reads found Alan Walker → Vishal Mishra → Atif Aslam in ~10s:
+
+```bash
+bx read --mode links --max 5000 "https://en.wikipedia.org/wiki/Alan_Walker" > out.txt   # every link on A
+bx read --mode links --max 5000 "https://en.wikipedia.org/wiki/Special:WhatLinksHere/Atif_Aslam?limit=5000" > in.txt   # every page linking to B
+# article names in both lists = a 2-hop route (A → X → B)
+```
+
+Extract the article names with a short script: keep the `/wiki/Name` part,
+drop names containing `:` (Special:, File:, Help:…) and `Main_Page`. Then
+intersect the two lists.
+
+- No overlap: take A's out-links, then run
+  `bx check "does this page link to <B>?" <url> <url> …` on them all at once.
+  A yes gives you A → X → Y → B. Never open them one by one.
+- `--mode links` stops at 300 links unless you pass `--max`. On Wikipedia,
+  always pass `--max 5000`.
+- `bx read --mode links --max 5000 <url> <url> …` lists the links of many
+  pages at once, one level deeper in a single command.
+- `bx read` (markdown) starts at the top of the page, which on Wikipedia
+  means menus. Scrolling does not change that. Use `--mode links` to see
+  what a page links to, not `read` + `eval`.
+
+#### A live race (click in real time, no background reads)
+
+When the user wants to watch the browser click through, walk it yourself.
+You choose each hop. jev is poor at "which link is closer to B": asked
+for that, `bx pick` returns `found nothing matching` or picks a citation
+like `[8]`, and `bx agent` goes India → Maldives → Asia. Each hop is two
+commands, about 3s in total:
+
+```bash
+bx read --mode links --max 5000 | grep -iE "pakistan|punjab|gujrat"   # what this page offers
+bx click 'a[href$="/Punjab,_Pakistan"]'                               # exact link, found even if offscreen
+```
+
+- Plan the route from what you know (A → country → region → B), and grep
+  each page for the next step's words. Don't scroll + `els | grep` to find
+  links: `els` only lists what is near the screen, and `bx els "<a|b>"`
+  takes CSS, not text.
+- Click by the link's address, not `text=`. `text=India` matches "Warner
+  Music India", and `text=Mumbai` hit the city's coat of arms and opened
+  the image viewer.
+- Wikipedia link text and the target differ. On Punjab, Pakistan, "Gujrat"
+  goes to `/Gujrat_Division`, and "Gujarat" is the Indian state. Take the
+  `href` from the grep line, and confirm the end page with
+  `bx check "is this about <B>"`.
+- Never type into the search box or click the logo in a race. `bx agent`
+  with "link by link" or "no search" in the goal is limited to article
+  links for the same reason.
+
 ## Rule 1 — batch everything
 
 Every action is a network round trip. Put the whole sequence in one `bx do`.
@@ -426,6 +484,9 @@ document has no match.
 - `covered` on a click means an overlay intercepted it. Dismiss the banner or
   modal and click again.
 - A batch stops at the first failure unless you pass `"stopOnError":false`.
+- Quote every URL. zsh treats `(`, `)`, `?` and `*` as glob characters, so
+  `bx open https://en.wikipedia.org/wiki/Jal_(band)` fails before bx even
+  runs. Write `bx open "https://…/Jal_(band)"`.
 
 ## More
 

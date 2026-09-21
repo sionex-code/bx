@@ -1,10 +1,54 @@
 # bx
 
-bx lets an AI agent drive your real Chrome browser. Not a fresh, empty,
-automation-flagged browser spun up by a script, but the actual Chrome you use
-every day, with your logins, your cookies, your extensions, your fingerprint.
-The agent clicks, types, scrolls, uploads files, and reads pages exactly as
-you would, through a small extension sitting quietly in your browser.
+**A browser your AI agent can use at the speed of a person who knows what
+they're doing.** bx lets an AI agent (Claude, MiniMax, anything that can run a
+shell command) drive your real, logged-in Chrome. A small fast model called
+**jev** makes the tiny "which button?" decisions in about a second, so the big
+model only plans and writes. Real jobs — posting to LinkedIn groups, researching
+200 Facebook groups, filling forms, collecting results from a site — take
+minutes, not the hour a model clicking one page at a time needs.
+
+## In one minute
+
+| | |
+|---|---|
+| **What it is** | A Chrome extension + a local bridge + one command, `bx`. Your agent runs `bx open`, `bx click`, `bx read`… and it happens in your own Chrome, with your logins. |
+| **Why it's fast** | Two brains. The **big model** (Claude, MiniMax…) plans, writes posts, answers you. **jev**, a small fast model, answers narrow questions: *which element? did it save? which of these 40 results fit?* About 1 second each, and it can judge a whole list or many pages at once. |
+| **Why it's not detected as a bot** | It is your normal Chrome: `navigator.webdriver` is `false`, same cookies, same fingerprint. |
+| **What it's for** | Real tasks on real sites: LinkedIn and Facebook groups, comment/reply runs, deep research into groups or a YouTube niche, forms, uploads, scraping to CSV. |
+
+### Why jev + a big model beats either alone
+
+- **A big model alone is slow.** Every click costs a full turn: read the page,
+  think, write the next command. Several seconds each, minutes for a task with
+  a few dozen decisions, an hour for a few hundred.
+- **A small fast model alone can't plan.** We tried it: jev-ultrafast and bx's
+  own `bx agent` both stall or wander on goals that need several steps of
+  thinking ahead (Alan Walker → Gujrat on Wikipedia, without the search box).
+  Given a link list to choose from, jev says "blocked" or picks the wrong
+  country.
+- **Together:** the big model plans the route and writes the words; jev and bx
+  do the clicking, judging and batch reading. On the same short tasks bx took
+  about 4–5 s where jev-ultrafast, another jev-based agent, took 8–10 s, and on
+  jobs with hundreds of items the batch commands (`sift`, `check`, `read`,
+  `each`) replace hundreds of model turns with a handful.
+
+### Which command, in plain words
+
+| You want to… | Run |
+|---|---|
+| open a page, click, type, screenshot | `bx open` · `bx click` · `bx type` · `bx shot` |
+| reach a page by clicking through a known flow | `bx agent "<goal>"` |
+| keep only the results that fit a rule | `bx sift "<rule>" --pages 5` |
+| ask yes/no about many pages at once | `bx check "<question>" <url> <url>…` |
+| read many pages in parallel | `bx read <url> <url>…` |
+| list every link on a page (link routes, wiki-walks) | `bx read --mode links --max 5000 "<url>"` |
+| do the same thing to every item (reply, comment, message) | `bx each` |
+
+Try it: `bx open "https://en.wikipedia.org/wiki/Alan_Walker"` then
+`bx read --mode links --max 5000 | grep -i india`.
+
+## How it works
 
 ```
 agent --HTTP / bx CLI--> bridge (127.0.0.1:8787) --WebSocket--> extension --> tab
