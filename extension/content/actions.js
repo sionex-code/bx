@@ -18,7 +18,9 @@ const opt = (a) => ({ speed: a.speed, timeout: a.timeout });
 // screenshot. Say how many matched, and hand back refs for the runners-up so
 // the correction is one `click ref=eN` rather than another discovery round.
 const hit = (el) => {
-  const h = { ref: BX.ref(el), sel: BX.durable(el) };
+  // The name travels with the result so memory can say what a click was on
+  // ("Pakistan") rather than a ref that means nothing on the next visit.
+  const h = { ref: BX.ref(el), sel: BX.durable(el), name: BX.textOf(el).replace(/\s+/g, ' ').trim().slice(0, 40) || undefined };
   if (!BX.actionable(el)) h.inert = true;
   const pool = BX.pool;
   if (pool && pool.length > 1 && pool[0] === el && !BX.deliberate) {
@@ -238,10 +240,146 @@ A.elements = async (a) => {
       const r = el.getBoundingClientRect();
       if (r.bottom < -400 || r.top > innerHeight + 1200) continue;
     }
-    out.push(BX.describe(el));
+    // A ref only means something for this snapshot. An agent that decides on
+    // one snapshot and acts on the next — which is every agent, on any page
+    // that re-renders — needs the durable selector in hand at decision time.
+    out.push(a.sel ? {
+      ...BX.describe(el), sel: BX.durable(el), where: BX.region(el),
+      // Where the link actually goes. An agent cannot tell a link it has
+      // already followed from a fresh one without it, nor a real link from a
+      // footnote marker that only scrolls the page it is already on.
+      href: typeof el.href === 'string' ? el.href : undefined
+    } : BX.describe(el));
     if (out.length >= (a.max || 150)) break;
   }
   return { url: location.href, title: document.title, n: out.length, elements: out };
+};
+
+// The repeated blocks on a page — search results, group cards, product tiles,
+// table rows — each as one item of text plus where it links. A research task
+// is mostly "go through this list and keep the good ones", and reading the
+// whole page as prose makes the caller rebuild the list boundaries itself.
+//
+// The heuristic: a list is a parent whose element children mostly share a tag
+// and class signature, each carrying some text. The biggest such group by
+// total text wins; site furniture never does.
+const sig = (el) => el.tagName + '.' + [...el.classList].filter((c) => !/\d{3,}|active|selected|hover|focus/i.test(c)).sort().join('.');
+const flat = (el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+// A `display: contents` wrapper has no box of its own, so it always reads as
+// invisible — and it is exactly what React lists wrap each row in (LinkedIn's
+// search results are built this way). Judge it by what it contains.
+const shown = (el) => BX.visible(el) || (getComputedStyle(el).display === 'contents' && [...el.children].some(shown));
+
+// innerText collapses a card's separate spans into one run — Trustpilot's
+// "4.7" and "14,792 reviews" come out as "4.714,792 reviews", which no reader,
+// human or model, can split back. Join the text nodes with a visible break.
+const pieces = (el) => {
+  const out = [];
+  const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => (SKIP.has(n.parentElement?.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT)
+  });
+  for (let n = w.nextNode(); n; n = w.nextNode()) {
+    const t = n.textContent.replace(/\s+/g, ' ').trim();
+    if (t) out.push(t);
+  }
+  return out.join(' · ');
+};
+
+A.items = async (a) => {
+  const root = a.target ? await BX.want(a.target, opt(a)) : (document.body || document.documentElement);
+  let best = null;
+  let scanned = 0;
+  for (const p of [root, ...root.querySelectorAll('*')]) {
+    if (++scanned > 20000) break;
+    if (p.children.length < 3 || SKIP.has(p.tagName)) continue;
+    const groups = new Map();
+    for (const c of p.children) {
+      const k = sig(c);
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(c);
+    }
+    for (const g of groups.values()) {
+      if (g.length < 3) continue;
+      const vis = g.filter(shown);
+      if (vis.length < 3) continue;
+      const texts = vis.map(flat);
+      const full = texts.filter((t) => t.length >= 12);
+      if (full.length < Math.max(3, vis.length * 0.6)) continue;
+      const where = BX.region(p);
+      if (['navigation', 'header', 'footer', 'sidebar'].includes(where)) continue;
+      // Rows of three words are a menu, not a result list: reward substance.
+      const score = texts.reduce((n, t) => n + Math.min(t.length, 600), 0);
+      if (!best || score > best.score) best = { score, els: vis, parent: p };
+    }
+  }
+  if (!best) return { url: location.href, title: document.title, n: 0, items: [] };
+
+  const cap = a.chars || 400;
+  const items = best.els.slice(0, a.max || 60).map((el, i) => {
+    const link = el.matches('a[href]') ? el : el.querySelector('a[href]');
+    return {
+      i,
+      text: pieces(el).slice(0, cap),
+      href: link ? link.href : undefined,
+      sel: BX.durable(link || el)
+    };
+  }).filter((x) => x.text);
+  return { url: location.href, title: document.title, n: items.length, of: best.els.length, list: BX.cssPath(best.parent), items };
+};
+
+// Where "the next page of these results" is. rel=next is the honest signal;
+// failing that, the pagination link or button that says next, or ›, or the
+// page number one above the current one.
+A.nextpage = async () => {
+  const ok = (el) => el && BX.visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+  const rel = document.querySelector('a[rel~="next"][href], link[rel~="next"][href]');
+  if (rel && (rel.tagName === 'LINK' || ok(rel))) return { href: rel.href };
+  const cands = BX.qsa('a[href], button, [role=button], [role=link]').filter(ok);
+  const label = (el) => `${el.getAttribute('aria-label') || ''} ${el.innerText || ''} ${el.title || ''}`.replace(/\s+/g, ' ').trim();
+  const nx = cands.find((el) => /^(next( page)?|›|»|→|>)$/i.test(label(el)) || /\bnext page\b/i.test(el.getAttribute('aria-label') || ''));
+  if (nx) return nx.href ? { href: nx.href } : { sel: BX.durable(nx) };
+  const cur = document.querySelector('[aria-current="page"], [aria-current="true"]');
+  const n = cur && parseInt(cur.innerText, 10);
+  if (n) {
+    const up = cands.find((el) => el.innerText.trim() === String(n + 1));
+    if (up) return up.href ? { href: up.href } : { sel: BX.durable(up) };
+  }
+  // No pager at all: a feed that loads more as you scroll (Facebook, LinkedIn,
+  // X). Say so, and let the caller scroll instead.
+  return { none: true, feed: true };
+};
+
+// Scroll the page's real scroller to the end so a feed loads its next batch.
+// Some apps scroll an inner element rather than the document, so take
+// whichever scrollable box is tallest.
+A.scrollend = async (a = {}) => {
+  let box = document.scrollingElement || document.documentElement;
+  for (const el of document.querySelectorAll('main, [role=main], [role=feed], div')) {
+    if (el.scrollHeight > el.clientHeight + 400 && el.scrollHeight > box.scrollHeight && /(auto|scroll)/.test(getComputedStyle(el).overflowY)) box = el;
+  }
+  const before = box.scrollHeight;
+  box.scrollTop = box.scrollHeight;
+  if (box === document.scrollingElement) window.scrollTo(0, box.scrollHeight);
+  // The next batch arrives over the network well after the DOM goes quiet
+  // from the scroll itself, so wait for the page to actually grow.
+  const deadline = Date.now() + (a.timeout ?? 3000);
+  while (box.scrollHeight <= before && Date.now() < deadline) await BX.sleep(100);
+  return { before, after: box.scrollHeight, grew: box.scrollHeight > before };
+};
+
+// Another page's text without opening it. Runs inside a tab already on that
+// site, so the request carries the real session and passes the same bot
+// checks the tab did — a fetch from outside the browser gets a login wall or
+// a "verifying your connection" page instead. Only as good as the HTML the
+// server sends: a site that builds its page in JavaScript (Facebook) returns
+// a shell with no text, and the caller falls back to a real tab.
+A.fetchtext = async (a) => {
+  const r = await fetch(a.url, { credentials: 'include', redirect: 'follow' });
+  const html = await r.text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('script, style, noscript, template, svg').forEach((x) => x.remove());
+  const text = doc.body ? toMd(doc.body) : '';
+  return { status: r.status, url: r.url, title: doc.title, len: text.length, text: text.slice(0, a.max || 6000) };
 };
 
 A.exists = async (a) => {
@@ -278,6 +416,24 @@ A.wait = async (a) => {
     if (a.for) { const el = BX.find(a.for); if (el) return { waited: Date.now() - t0, ...hit(el) }; }
     else if (a.gone) { if (!BX.find(a.gone)) return { waited: Date.now() - t0 }; }
     else if (a.text) { if ((document.body?.innerText || '').toLowerCase().includes(String(a.text).toLowerCase())) return { waited: Date.now() - t0 }; }
+    else if (a.settle) {
+      // Loaded, then quiet: no DOM change for `quiet` ms. Never fails — a page
+      // that keeps animating forever is still worth reading, so on the deadline
+      // it just reports that it did not settle.
+      if (document.readyState === 'complete') {
+        const quiet = a.quiet ?? 300;
+        const settled = await new Promise((res) => {
+          let t;
+          const mo = new MutationObserver(() => { clearTimeout(t); t = setTimeout(done, quiet); });
+          const stop = setTimeout(() => { mo.disconnect(); clearTimeout(t); res(false); }, Math.max(0, deadline - Date.now()));
+          function done() { mo.disconnect(); clearTimeout(stop); res(true); }
+          mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+          t = setTimeout(done, quiet);
+        });
+        return { waited: Date.now() - t0, settled };
+      }
+      if (Date.now() >= deadline) return { waited: Date.now() - t0, settled: false };
+    }
     else if (a.load) { if (document.readyState === 'complete') return { waited: Date.now() - t0 }; }
     else return { waited: 0 };
     const left = deadline - Date.now();

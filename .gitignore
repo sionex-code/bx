@@ -1,0 +1,9 @@
+# Runtime state lives in ~/.bx, never here — but guard against copies of it.
+config.json
+.env
+*.key
+shots/
+memory/
+node_modules/
+*.log
+runs/

@@ -140,7 +140,11 @@ BX.qsa = (sel, deep) => {
   return out;
 };
 
-BX.INTERACTIVE = 'a[href],button,input:not([type=hidden]),select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=radio],[role=switch],[role=option],[role=combobox],[role=textbox],[contenteditable=""],[contenteditable="true"],[onclick],[tabindex]:not([tabindex="-1"])';
+// Custom checkboxes and radios hide the real <input> (opacity 0, or a
+// 1px box) and draw a styled <label> instead, so the input never passes the
+// visibility check and the option vanishes from the list — Fiverr's "Seller
+// lives in: Pakistan" was one. The label is what a person clicks; list it.
+BX.INTERACTIVE = 'label:has(input[type=checkbox]),label:has(input[type=radio]),a[href],button,input:not([type=hidden]),select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=radio],[role=switch],[role=option],[role=combobox],[role=textbox],[contenteditable=""],[contenteditable="true"],[onclick],[tabindex]:not([tabindex="-1"])';
 
 // ── text lookup ──────────────────────────────────────────────────────────
 // This used to scan every div and span on the page, calling getComputedStyle
@@ -431,6 +435,26 @@ BX.durable = (el) => {
   const href = tag === 'A' && at('href');
   if (href && href.length < 90) { const s = one(`a[href="${qval(href)}"]`); if (s) return s; }
   return BX.cssPath(el);
+};
+
+// Which part of the page an element lives in. Without this an agent sees
+// Wikipedia's "Read" and "Edit" tabs as interchangeable with the links in the
+// article, and spends its whole budget flipping between them. The walk goes
+// innermost-first on purpose: a link in a <nav> inside <main> is navigation.
+BX.region = (el) => {
+  for (let n = el; n && n.nodeType === 1 && n !== document.documentElement; n = n.parentElement) {
+    const tag = n.tagName;
+    const role = (n.getAttribute && n.getAttribute('role') || '').toLowerCase();
+    const id = n.id || '';
+    if (tag === 'NAV' || role === 'navigation' || role === 'tablist' || role === 'menubar') return 'navigation';
+    if (tag === 'HEADER' || role === 'banner') return 'header';
+    if (tag === 'FOOTER' || role === 'contentinfo') return 'footer';
+    if (tag === 'ASIDE' || role === 'complementary') return 'sidebar';
+    if (tag === 'DIALOG' || role === 'dialog' || role === 'alertdialog') return 'dialog';
+    if (tag === 'FORM') return 'form';
+    if (tag === 'MAIN' || tag === 'ARTICLE' || role === 'main' || id === 'content' || id === 'main' || id === 'mw-content-text') return 'main content';
+  }
+  return undefined;
 };
 
 BX.describe = (el) => ({
