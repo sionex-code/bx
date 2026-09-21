@@ -172,15 +172,18 @@ commands doing that and posted a single comment. Instead:
 
 ```bash
 bx items --chars 2000 --max 15          # each post's full text, each with a ref (e.g. e5)
-# read them, write one comment per post you pick, then per post:
-bx click text=Comment --in ref=e5       # opens the comment box; the output lists the new buttons
-bx do --in ref=e5 '[{"a":"type","target":"[contenteditable]","text":"…"},{"a":"click","target":"text=<send button>"}]'
-bx check "my comment is posted under this post" --in ref=e5
+# read them, write one comment per post you pick, then two commands per post:
+bx click text=Comment --in ref=e5       # opens that post's comment box
+bx type "[contenteditable]" "…" --in ref=e5 --send
 ```
 
-Use the send button's label as the page shows it, from the click output or
-`bx els --in ref=e5`. Sites differ: LinkedIn's says "Comment", not "Post".
-A guessed label can match nothing, or the wrong button.
+`--send` presses the send button next to the box, whatever the site calls
+it, and bx confirms the text left the box (`✓ sent`). That is the check:
+no `sleep`, no `els | grep` for your name, no `bx check` afterwards. Always
+pass `--in`. With two comment boxes open, a bare `type` now refuses rather
+than guessing. `bx scroll 3` scrolls three screens (`down`/`up` N too), and
+`bx wait 1500` pauses 1.5s. If `sift` prints `??` rows because jev is down,
+judge those rows from their text yourself; do not sleep and retry.
 
 **How to know it was actually sent.** Text sitting in an input box is not
 posted. bx shows it as `[unsent text in "…": …]` in `read`, `items` and

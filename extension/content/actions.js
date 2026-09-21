@@ -80,8 +80,17 @@ A.drag = async (a) => {
 };
 
 // ── input ────────────────────────────────────────────────────────────────
+const isBox = (el) => el && (el.isContentEditable || el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && /^(|text|search|email|url|tel)$/i.test(el.type || '')));
+
 A.type = async (a) => {
   const el = await BX.want(a.target, opt(a));
+  // Two text boxes answer to the same target — one per post in a feed, say —
+  // and the first one is not necessarily the one meant. Typed into the wrong
+  // box, a reply lands under someone else's post, so refuse instead of guess.
+  if (!a.fromFill && !a.in && !BX.deliberate && !String(a.target).startsWith('ref=')) {
+    const boxes = (BX.pool || []).filter((x) => isBox(x) && BX.actionable(x));
+    if (boxes.length > 1) BX.fail(`${boxes.length} text boxes match ${typeof a.target === 'string' ? a.target : JSON.stringify(a.target)} (${boxes.slice(0, 4).map((x) => BX.ref(x)).join(', ')}) — say which: --in <the item's ref>, or ref=eN`);
+  }
   if (a.focus !== 'direct') await BX.clickAt(el, { speed: a.speed });
   else { await BX.ensureVisible(el); try { el.focus({ preventScroll: true }); } catch {} }
   const r = await BX.typeInto(el, a.text, { speed: a.speed, clear: a.clear });
@@ -115,7 +124,7 @@ A.fill = async (a) => {
         out.push({ sel, ok: true, as: 'check' }); continue;
       }
       if (a.fast) { try { el.focus({ preventScroll: true }); } catch {} BX.setValue(el, String(val)); }
-      else await A.type({ target: sel, text: String(val), speed: a.speed, clear: true });
+      else await A.type({ target: sel, text: String(val), speed: a.speed, clear: true, fromFill: true });
       out.push({ sel, ok: true });
     } catch (e) {
       out.push({ sel, ok: false, error: String(e.message || e) });
@@ -163,7 +172,8 @@ A.scroll = async (a) => {
   const scroller = box || BX.scroller();
   const maxY = scroller.scrollHeight - scroller.clientHeight;
   let dx = 0, dy = 0;
-  if (a.by) { dx = a.by[0] || 0; dy = a.by[1] ?? a.by; }
+  if (a.screens) dy = Math.round((scroller.clientHeight || innerHeight) * 0.85 * a.screens);
+  else if (a.by) { dx = a.by[0] || 0; dy = a.by[1] ?? a.by; }
   else if (a.to === 'bottom') dy = maxY - scroller.scrollTop;
   else if (a.to === 'top') dy = -scroller.scrollTop;
   else if (typeof a.to === 'number') dy = a.to - scroller.scrollTop;
@@ -186,6 +196,31 @@ A.scroll = async (a) => {
   }
   await BX.sleep(a.settle ?? (instant ? 0 : 60));
   return { y: Math.round(scroller.scrollTop), max: Math.round(maxY), atBottom: scroller.scrollTop >= maxY - 2 };
+};
+
+// Press the button that sends what was just typed. Found from the box
+// outwards: the nearest button after it, inside the same form or the same
+// small container, that has a visible label. Emoji, GIF and photo buttons
+// are icons without one. The LinkedIn comment runs spent two commands per
+// comment finding this button with els | grep, and one guessed "Post" and
+// clicked a menu instead; the bridge then checks that the text left the box.
+A.send = async (a) => {
+  const box = a.target ? await BX.want(a.target, opt(a)) : document.activeElement;
+  if (!isBox(box)) BX.fail('send needs the text box that was typed into (a target, or focus in it)');
+  const after = (b) => box.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING;
+  const label = (b) => (b.innerText || b.value || '').replace(/\s+/g, ' ').trim();
+  const form = box.closest('form');
+  if (form) {
+    const sub = [...form.querySelectorAll('button[type=submit], input[type=submit]')].find((b) => BX.visible(b));
+    if (sub) { const r = await BX.clickAt(sub, { speed: a.speed }); return { ...hit(sub), ...r }; }
+  }
+  let p = box.parentElement;
+  for (let up = 0; p && up < 8; up++, p = p.parentElement) {
+    const btn = [...p.querySelectorAll('button, [role=button], input[type=submit]')]
+      .find((b) => after(b) && BX.visible(b) && label(b) && !box.contains(b));
+    if (btn) { const r = await BX.clickAt(btn, { speed: a.speed }); return { ...hit(btn), ...r }; }
+  }
+  BX.fail('no send button next to that text box — find it with bx els --in <item ref>');
 };
 
 // ── reading ──────────────────────────────────────────────────────────────
