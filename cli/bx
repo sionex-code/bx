@@ -227,6 +227,7 @@ function render(out) {
     detail(r.a, r.r);
   }
   if ((out.results || []).length > 1) console.log(dim(`${DOT} ${out.results.length} actions in ${out.ms}ms  tab ${out.tab}`));
+  for (const w of out.warnings || []) console.log(`\n  ${red('▲ not sent:')} ${yel(w)}`);
   if (out.memory) {
     // The briefing is worth reading once. Reprinted on every failure it was
     // 40k characters of the same lines in one LinkedIn run — context an agent
@@ -244,7 +245,7 @@ function render(out) {
     console.log(`    ${dim(l.flow)}`);
     console.log(`    ${dim('every next page, one command:')} ${bold(`bx recipe ${l.name} <url>${l.vars.map((v) => ` '${v}=…'`).join('')}`)}`);
   } else if (hint) console.log(`\n  ${mag('▸')} ${dim(hint)}`);
-  return out.ok ? 0 : 1;
+  return out.ok && !(out.warnings || []).length ? 0 : 1;
 }
 
 function seenRecently(host) {
@@ -801,7 +802,7 @@ async function main() {
     }
 
     case 'items': {
-      const r = await api('POST', '/items', { ...common(), target: args[0] || flags.target, max: num(flags.max) || 60, chars: num(flags.chars), pages: num(flags.pages) });
+      const r = await api('POST', '/items', { ...common(), target: args[0] || flags.target || (typeof flags.in === 'string' ? flags.in : undefined), max: num(flags.max) || 60, chars: num(flags.chars), pages: num(flags.pages) });
       if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
       if (!r.ok) die(r.error || 'items failed');
       if (!r.n) die('no repeated list found — narrow it: bx items "<css of the list>"');

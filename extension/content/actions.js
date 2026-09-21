@@ -191,12 +191,34 @@ A.scroll = async (a) => {
 // ── reading ──────────────────────────────────────────────────────────────
 const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'TEMPLATE', 'IFRAME', 'CANVAS']);
 
+// ── typed but not sent ───────────────────────────────────────────────────
+// Text in an input box is not page content. Read as plain text, a comment
+// typed and never posted looks exactly like one that was: two agents in a
+// row "confirmed" five LinkedIn comments by finding their text on the page,
+// and all five were still sitting unsent in their comment boxes. Everywhere
+// bx reads a page, such text is marked as what it is.
+const editRoot = (n) => n && n.nodeType === 1 && n.isContentEditable && !(n.parentElement && n.parentElement.isContentEditable);
+const fieldName = (el) => (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || el.getAttribute('name') || 'a text box').slice(0, 60);
+const draftMark = (el, t) => `[unsent text in "${fieldName(el)}": ${t.replace(/\s+/g, ' ').trim().slice(0, 300)}]`;
+BX.drafts = (root = document) => {
+  const out = [];
+  for (const el of root.querySelectorAll('[contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"], textarea, input:not([type]), input[type=text], input[type=search]')) {
+    if (el.tagName !== 'TEXTAREA' && el.tagName !== 'INPUT' && !editRoot(el)) continue;
+    const t = (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' ? el.value : el.innerText) || '';
+    if (!t.trim() || !BX.visible(el)) continue;
+    out.push({ el, label: fieldName(el), text: t.replace(/\s+/g, ' ').trim() });
+  }
+  return out;
+};
+A.drafts = async () => ({ drafts: BX.drafts().map((d) => ({ ref: BX.ref(d.el), label: d.label, text: d.text.slice(0, 300) })) });
+
 const toMd = (root) => {
   const out = [];
   const walk = (n, depth) => {
     if (!n || depth > 40) return;
     if (n.nodeType === 3) { const t = n.textContent.replace(/\s+/g, ' '); if (t.trim()) out.push(t); return; }
     if (n.nodeType !== 1 || SKIP.has(n.tagName)) return;
+    if (editRoot(n)) { const t = n.innerText || ''; if (t.trim()) out.push(`\n${draftMark(n, t)}\n`); return; }
     const st = n.ownerDocument.defaultView?.getComputedStyle(n);
     if (st && (st.display === 'none' || st.visibility === 'hidden')) return;
     const tag = n.tagName;
@@ -228,6 +250,13 @@ A.read = async (a) => {
     const out = BX.qsa(a.skip)[0];
     const t = out && (mode === 'text' ? out.innerText : toMd(out));
     if (t && t.trim()) text = text.replace(t, '');
+  }
+  if (mode === 'text') {
+    for (const d of BX.drafts(el)) {
+      if (d.el.tagName === 'TEXTAREA' || d.el.tagName === 'INPUT') continue;   // not in innerText anyway
+      const raw = d.el.innerText;
+      if (raw && text.includes(raw)) text = text.replace(raw, draftMark(d.el, raw));
+    }
   }
   const cap = a.max || 40000;
   return {
@@ -290,12 +319,13 @@ const shown = (el) => BX.visible(el) || (getComputedStyle(el).display === 'conte
 const pieces = (el) => {
   const out = [];
   const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
-    acceptNode: (n) => (SKIP.has(n.parentElement?.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT)
+    acceptNode: (n) => (SKIP.has(n.parentElement?.tagName) || n.parentElement?.isContentEditable ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT)
   });
   for (let n = w.nextNode(); n; n = w.nextNode()) {
     const t = n.textContent.replace(/\s+/g, ' ').trim();
     if (t) out.push(t);
   }
+  for (const d of BX.drafts(el)) out.push(draftMark(d.el, d.text));
   return out.join(' · ');
 };
 
