@@ -245,9 +245,10 @@ A.elements = async (a) => {
   const out = [];
   let scanned = 0;
   const skip = a.skip ? BX.qsa(a.skip)[0] : null;
+  const inside = a.in ? await BX.want(a.in, { timeout: a.timeout ?? 3000 }) : null;
   for (const el of BX.qsa(sel)) {
     if (++scanned > 6000) break;   // pathological page — report what we have
-    if (seen.has(el) || !BX.visible(el) || (skip && skip.contains(el))) continue;
+    if (seen.has(el) || !BX.visible(el) || (skip && skip.contains(el)) || (inside && !inside.contains(el))) continue;
     seen.add(el);
     if (a.viewport !== false && !BX.inView(el)) {
       const r = el.getBoundingClientRect();

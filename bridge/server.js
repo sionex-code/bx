@@ -424,7 +424,7 @@ async function checkOne(url, list, b) {
 // `bx check` and by `bx each`, which asks it once per item it opens.
 async function checkHere(b, list) {
   const look = await runBatch({ tab: b.tab ?? 'active', memory: false, stopOnError: false,
-    actions: [{ a: 'wait', settle: true, timeout: 3000 }, { a: 'read', mode: 'text', max: b.max || 5000, skip: b.skip }, { a: 'elements', max: 40, skip: b.skip }] });
+    actions: [{ a: 'wait', settle: true, timeout: 3000 }, { a: 'read', mode: 'text', max: b.max || 5000, skip: b.skip, target: b.in }, { a: 'elements', max: 40, skip: b.skip, in: b.in }] });
   look.results.shift();
   const page = look.results[0]?.r || {};
   const els = look.results[1]?.r?.elements || [];
@@ -432,6 +432,7 @@ async function checkHere(b, list) {
     // In a list-and-detail app the page also shows every other row; say
     // which one the question is about, or its neighbours answer for it.
     (b.about ? `\nTHE QUESTION IS ABOUT THE ITEM THAT IS OPEN NOW: ${b.about}\nOther items listed on the page are not it.\n` : '') +
+    (b.in ? '\nTHE TEXT BELOW IS ONE PART OF THE PAGE ONLY (one post, card or row), not the whole page.\n' : '') +
     `\nPAGE TEXT:\n${page.text || ''}\n\nELEMENTS:\n` +
     els.map((e) => `  ${agent.label(e)}`).join('\n');
   const qs = {};

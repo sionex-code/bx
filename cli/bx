@@ -728,7 +728,8 @@ async function main() {
       }
       const q = args.join(' ');
       if (!q) die(`check needs a question — ${bold('bx check "am I logged in"')}`);
-      const r = await api('POST', '/jev/check', { question: q, tab: common().tab, see: see() });
+      // --in: ask about one post, card or row instead of the whole page.
+      const r = await api('POST', '/jev/check', { question: q, tab: common().tab, see: see(), in: typeof flags.in === 'string' ? flags.in : undefined });
       if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
       if (!r.ok) die(r.error || 'check failed');
       if (r.unreadable) {
