@@ -173,9 +173,21 @@ commands doing that and posted a single comment. Instead:
 ```bash
 bx items --chars 2000 --max 15          # each post's full text, each with a ref (e.g. e5)
 # read them, write one comment per post you pick, then per post:
-bx click text=Comment --in ref=e5
-bx do --in ref=e5 '[{"a":"type","target":"[contenteditable]","text":"…"},{"a":"click","target":"text=Post"}]'
+bx click text=Comment --in ref=e5       # opens the comment box; the output lists the new buttons
+bx do --in ref=e5 '[{"a":"type","target":"[contenteditable]","text":"…"},{"a":"click","target":"text=<send button>"}]'
+bx check "my comment is posted under this post" --in ref=e5
 ```
+
+Use the send button's label as the page shows it, from the click output or
+`bx els --in ref=e5`. Sites differ: LinkedIn's says "Comment", not "Post".
+A guessed label can match nothing, or the wrong button.
+
+**How to know it was actually sent.** Text sitting in an input box is not
+posted. bx shows it as `[unsent text in "…": …]` in `read`, `items` and
+`check`, so finding your words on the page proves nothing. If you type and
+then click, and the text is still in the box afterwards, the output says
+`▲ not sent:` and the command fails. Confirm with `bx check "…" --in ref=eN`.
+Never confirm by grepping page text.
 
 `--in <target>` makes every action in the command act only inside that
 element, so `text=Comment` means this post's button. `bx scroll` and

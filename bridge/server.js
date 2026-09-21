@@ -433,6 +433,8 @@ async function checkHere(b, list) {
     // which one the question is about, or its neighbours answer for it.
     (b.about ? `\nTHE QUESTION IS ABOUT THE ITEM THAT IS OPEN NOW: ${b.about}\nOther items listed on the page are not it.\n` : '') +
     (b.in ? '\nTHE TEXT BELOW IS ONE PART OF THE PAGE ONLY (one post, card or row), not the whole page.\n' : '') +
+    // Typed-but-unsent text is marked in the page text; say what the mark means.
+    (/\[unsent text in "/.test(page.text || '') ? '\nNOTE: text shown as [unsent text in "…": …] is sitting in an input box, typed but NOT submitted or posted.\n' : '') +
     `\nPAGE TEXT:\n${page.text || ''}\n\nELEMENTS:\n` +
     els.map((e) => `  ${agent.label(e)}`).join('\n');
   const qs = {};
@@ -686,6 +688,7 @@ async function runBatch(b) {
   }, budget);
 
   spill(out, b.inline === true);
+  if (b.memory !== false) { try { await unsent(actions, out); } catch {} }
   const ok = out.results.every((r) => r.ok);
   note('do', { n: actions.length, ms: Date.now() - t0, ok });
 
@@ -709,6 +712,40 @@ async function runBatch(b) {
   } catch (e) { note('err', { error: 'memory: ' + String(e.message || e) }); }
 
   return { ok, ...out, ...(memory ? { memory } : {}) };
+}
+
+// ── typed, clicked, still sitting there ──────────────────────────────────
+// Typing and then clicking "send" is the one step whose failure looks like
+// success: the click lands somewhere, reports ok, and the text stays in the
+// box. Five LinkedIn comments went that way and two agents then "confirmed"
+// them by finding the text on the page. So bx remembers what was typed in
+// each tab, and after the next click or Enter looks at the input boxes: if
+// the text is still in one, the result says so.
+const PENDING = new Map();   // tab id -> { text, at }
+const squash = (t) => String(t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+async function unsent(actions, out) {
+  const rs = out.results || [];
+  let typedAt = -1;
+  rs.forEach((r, i) => {
+    const a = actions[i];
+    if (r.ok && a && a.a === 'type' && squash(a.text).length >= 8) { PENDING.set(out.tab, { text: squash(a.text).slice(0, 40), at: Date.now() }); typedAt = i; }
+  });
+  const p = PENDING.get(out.tab);
+  if (!p || Date.now() - p.at > 5 * 60000) { PENDING.delete(out.tab); return; }
+  const sent = rs.some((r, i) => r.ok && i > typedAt && actions[i] && (actions[i].a === 'click' || (actions[i].a === 'press' && /enter/i.test([].concat(actions[i].keys || actions[i].key).join(' '))))) ||
+    rs.some((r, i) => r.ok && actions[i] && actions[i].a === 'type' && actions[i].enter);
+  if (!sent) return;
+  // A real submit clears the box, sometimes only after a network round trip.
+  for (let tries = 0; tries < 5; tries++) {
+    if (tries) await new Promise((ok) => setTimeout(ok, 500));
+    const d = await call({ t: 'run', tab: out.tab, actions: [{ a: 'drafts' }], timeout: 3000, stopOnError: true, speed: 'instant', trusted: false }, 6000);
+    const still = (d.results?.[0]?.r?.drafts || []).find((x) => squash(x.text).includes(p.text));
+    if (!still) { PENDING.delete(out.tab); return; }
+    if (tries === 4) {
+      (out.warnings = out.warnings || []).push(`the text you typed is still in "${still.label}" (${still.ref}) after that click — it was NOT sent. The click hit something else; find the real send button inside the same item (bx els --in <item ref>): it may say Comment, Send or Reply rather than Post.`);
+    }
+  }
 }
 
 const server = http.createServer(async (req, res) => {
