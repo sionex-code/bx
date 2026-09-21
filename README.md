@@ -16,6 +16,64 @@ It can also drive itself. `bx agent "<goal>"` reads the page, asks **jev**
 which element advances the goal, acts, and repeats until it is done or until
 it is not confident enough to continue — about 1.2 seconds per decision.
 
+## How jev makes agentic browsing faster
+
+An LLM driving a browser spends almost all of its time on small decisions.
+Which link is the next page? Did the save go through? Is this search result
+one of the ones I want? Each one costs a full turn of the model: read the page
+into context, think, write out an answer, pick the next command. That is
+several seconds per decision at best. Some models take a minute and a half
+to look at one screenshot. A task with a few hundred of these decisions takes
+an hour, however fast the browser is.
+
+**jev** (OpenJev, on codiv.ai) takes those decisions off the agent. It is a
+*System One* model: it does not write text. It gets the page and a question
+with a fixed set of answers (yes/no, one of these elements, keep/drop) and
+returns a probability for each answer in about a second. bx turns what the
+agent is about to decide into that shape and sends it:
+
+| the agent would… | with jev | typical time |
+|---|---|---|
+| read a result list and judge every item itself | `bx sift "<criterion>" --pages N`: 10 items per call, calls in parallel, pages turned or feeds scrolled by bx | ~1.5s a page |
+| open N pages one by one to answer the same question | `bx check "<question>" <url> …`: every page in a background tab at once | ~15s for 10 |
+| work out which element to click | `bx pick "the X"` | ~1s |
+| take a screenshot and look at it | `bx check "<question>" --see` | ~3s |
+| click through a flow step by step | `bx agent "<goal>"` | ~1.2s a step |
+
+The agent's own turns are left for the work that actually needs a big model:
+planning the task, writing the script that builds the table, and answering
+the user. A 200-row research job becomes a handful of agent turns plus a few
+hundred one-second jev calls, instead of a few hundred agent turns.
+
+jev also makes the result better, not only faster. On a list, an agent under
+time pressure tends to fall back on keyword matching. In one run, a Python
+filter kept every group whose *search query* said "pakistan", and kept a
+"Forex Signal" group as a Pakistani investor community. `bx check "run for
+Pakistani retail investors, not a trading-signals or spam group"` rejected
+that group with 100% confidence, in 14.7s across three pages.
+
+### Big jobs do not stall
+
+Agent harnesses kill a shell command after about two minutes. Before, a
+50-page `bx read` said nothing until its last page had loaded. When the
+harness killed it, everything already read was lost. `read` and `check` with
+many URLs now:
+
+- print each page the moment it finishes,
+- write every result to a journal (`~/.bx/runs/*.jsonl`, or `--out file`),
+- cap each page at 30s, so one hung tab cannot hold up the rest,
+- stop starting new pages after 75s (`--budget N`) and end with `N left — run
+  the exact same command again`. The rerun skips finished pages and retries
+  failed ones.
+
+```
+8 pages · 3 at a time
+═══ Forex Signal | Facebook  tab 5.8s
+…
+4 pages in 18.9s · 4/8 done · journal ~/.bx/runs/read-444c2ed12cf0.jsonl
+  ▸ 4 left — run the exact same command again; finished pages are skipped, failed ones retried
+```
+
 ## What bx actually is
 
 Most browser automation tools work by launching a *new* browser instance
@@ -217,6 +275,7 @@ bx sift "an AI or machine learning gig" --pages 3      # 120 gigs judged in ~20s
 bx items --pages 3 --json                              # the raw rows, no model at all
 bx check "the group allows anonymous posts" <url> <url> ...   # many pages at once, in background tabs
 bx read <url> <url> ... --max 1500                            # many pages' text at once
+bx read --file urls.txt --max 2000                            # hundreds: time-boxed, journaled, rerun to continue
 ```
 
 `sift` finds the page's repeated list (results, cards, rows), sends it to jev
@@ -406,6 +465,34 @@ Where the time went before, from the logs:
 - Hunting through filter dropdowns. Custom checkboxes were invisible to `els`,
   and `info` cut URLs off before the filter part. Both are fixed, and a filter
   set by clicking is now remembered as a URL parameter for next time.
+
+### Case study: 200 Facebook investment groups
+
+Task: "list 200 Facebook groups with potential Pakistani investors, no spam,
+every detail in a CSV." MiniMax-M3 in opencode, timed from the session log.
+In this run it used bx's parallel reads but **never called jev**. It filtered
+with Python keyword lists instead, which makes it a clean baseline.
+
+| phase | time |
+|---|---|
+| one screenshot, viewed by the model | 1.6 min |
+| 19 searches, scrolled by hand, `bx items` | 4.4 min |
+| re-reading the first 50 pages to learn the format | 3.8 min |
+| reading all 570 group About pages (~2s each, 4–8 tabs) | ~19 min |
+| batches killed by the 120s limit or hung | ~3 min |
+| model API stall (no command running) | 16 min |
+| **CSV delivered** | **49 min** (~30 without the stall) |
+
+Of the 200 groups it chose, only 134 mention anything Pakistani in their own
+name or description. The rest got in because the search phrase did.
+
+The same job run the way the skill now prescribes: `sift` each search while
+bx scrolls it, `check` the keepers, read only those, and rerun on `N left`.
+That is expected to take **10–15 minutes**, with jev making the "Pakistani, not
+spam" call on every group. This is an estimate from the phase times above,
+not a measured run. By hand, with the same nine columns, it is roughly 7–10
+hours: about 1.5–2 minutes to open and copy each of 200 groups, plus the
+searching and skimming.
 
 jev itself:
 

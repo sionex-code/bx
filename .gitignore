@@ -6,3 +6,4 @@ shots/
 memory/
 node_modules/
 *.log
+runs/
