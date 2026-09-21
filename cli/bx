@@ -122,7 +122,7 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a.startsWith('--')) {
     const [k, v] = a.slice(2).split('=');
-    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out'].includes(k) ? argv[++i] : true) : v;
+    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out', 'last', 'if', 'check', 'do'].includes(k) ? argv[++i] : true) : v;
   } else args.push(a);
 }
 const num = (v) => (v === undefined ? undefined : Number(v));
@@ -162,6 +162,23 @@ function nudge(out) {
       return `jev: opening ${host} pages one by one — ${bold('bx check "<question>" <url> <url> …')} or ${bold('bx read <url> <url> …')} does them all at once in background tabs`;
     }
   }
+  // Open, type, send, next: the per-item loop `bx each` replaces. The
+  // LinkedIn inbox run did it by hand for nine conversations — seven minutes
+  // of one command per model turn.
+  const typed = rs.find((r) => r.a === 'type');
+  if (typed) {
+    const file = path.join(HOME, 'types.json');
+    let trail = [];
+    try { trail = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+    const now = Date.now();
+    let host = '';
+    try { host = new URL(out.url || '').host; } catch {}
+    trail = trail.filter((x) => now - x.at < 180000).concat(host ? [{ host, at: now }] : []).slice(-10);
+    try { fs.writeFileSync(file, JSON.stringify(trail)); } catch {}
+    if (host && trail.filter((x) => x.host === host).length >= 2) {
+      return `jev: doing the same thing to one item after another — ${bold(`bx each --if "<which rows>" --check "<question about the open row>" --do '[…{{first}}…]'`)} runs the whole list in one command`;
+    }
+  }
   // Scroll, sleep, scroll, sleep, then items: the Facebook run did that 18
   // times by hand. --pages already scrolls a feed and waits for the new rows.
   if (rs.filter((r) => r.a === 'scroll').length >= 2) {
@@ -199,7 +216,9 @@ function recall(m, wide) {
   const row = (k, v, colour = dim) => console.log(`    ${mag(k.padEnd(7))} ${colour(v)}`);
   console.log(`\n  ${mag('▸ memory')} ${bold(m.host)}${m.for ? dim(`  (nothing on ${m.for}; using the parent domain)`) : ''}`);
   for (const r of m.recipes || []) {
-    row('recipe', `${bold(r.name)}  ${r.steps} steps · ${r.ok} ok${r.path ? ` · ${r.path}` : ''}${r.vars ? dim(`  needs ${r.vars.join(' ')}`) : ''}`, (x) => x);
+    row('recipe', r.broken
+      ? dim(`${r.name}  ${r.steps} steps · ${r.ok} ok · broken, do not replay`)
+      : `${bold(r.name)}  ${r.steps} steps · ${r.ok} ok${r.path ? ` · ${r.path}` : ''}${r.vars ? dim(`  needs ${r.vars.join(' ')}`) : ''}`, (x) => x);
     if (wide) console.log(`            ${dim(r.flow)}`);
   }
   for (const u of m.urls || []) row('url', u, (x) => x);
@@ -265,7 +284,8 @@ function agentEnd(out) {
 // it is the single most likely reason a step "worked" and nothing happened.
 const amb = (r) =>
   (r && r.n > 1 ? yel(`  ${DOT} ${r.n} matched`) : '') +
-  (r && r.inert ? red(`  ${DOT} disabled`) : '');
+  (r && r.inert ? red(`  ${DOT} disabled`) : '') +
+  (r && r.healed ? dim(`  ${DOT} ref ${r.healed} was stale, re-found by its text as ${r.ref}`) : '');
 
 function summary(a, r) {
   if (!r || typeof r !== 'object') return dim(String(r ?? ''));
@@ -313,7 +333,9 @@ const run = async (actions) => process.exit(render(await api('POST', '/do', { ..
 const settled = async (actions) => {
   if (flags['no-wait']) return run(actions);
   const out = await api('POST', '/do', { ...common(), actions: [{ a: 'wait', settle: true, timeout: 4000 }, ...actions] });
-  if (out.results && out.results[0]?.a === 'wait') out.results.shift();
+  // Drop the wait only when it worked. A failed one is the whole answer —
+  // an error page, a dead tab — and hiding it printed nothing at all.
+  if (out.results && out.results[0]?.a === 'wait' && (out.results[0].ok || out.results.length > 1)) out.results.shift();
   process.exit(render(out));
 };
 
@@ -332,6 +354,10 @@ ${bold('agent')}  ${dim('jev decides the next move from the live page — on by 
   check <question> <url>...   same question on many pages at once, in background tabs  ${dim('--parallel N --file F')}
   sift <criterion>            judge every item in the page's list at once  ${dim('--pages N --all --max N --target SEL')}
   items [target]              the page's repeated list (results, cards, rows) as items, no model  ${dim('--pages N')}
+  each [list] --if C --check Q --do '[…]'
+                              for every row of the list: keep rows matching C (from their text),
+                              open each, ask Q about it, run the batch if yes  ${dim('{{name}} {{first}} {{text}} {{href}}')}
+                              ${dim('--dry  --max N (20)  --budget S (90)  --keepgoing  --fresh')}
   jev [key|on|off|model|set|ask]
 
 ${bold('page')}
@@ -363,7 +389,7 @@ ${bold('tabs')}
 
 ${bold('memory')}  ${dim('bx learns every site as you drive it — flows, selectors, traps')}
   memo [host]                 everything known about a site   ${dim('--all to list sites')}
-  learn <name>                name the flow you just ran      ${dim('--back N for an earlier one')}
+  learn <name>                name the flow you just ran      ${dim('--last N: your last N actions, across commands')}
   recipe <name> [var=val...]  replay it            ${dim('bx memo names the vars')}
   note <text>                 remember something about this site
   forget [what] [host]        ${dim('all | notes | traces | traps | selectors | recipe <name>')}
@@ -543,11 +569,20 @@ async function main() {
     case 'learn': {
       const name = args[0];
       if (!name) die('learn what? give the flow a name, e.g. bx learn login');
-      const r = await api('POST', '/memory/learn', { name, host: flags.host, index: num(flags.back), note: flags.note === true ? undefined : flags.note });
+      const r = await api('POST', '/memory/learn', { name, host: flags.host, index: num(flags.back), last: num(flags.last), note: flags.note === true ? undefined : flags.note });
       if (!r.ok) die(r.error);
       console.log(`${OK} ${bold(r.host)} knows ${bold(r.name)} ${dim(`— ${r.steps} steps`)}`);
       console.log(`    ${dim(r.flow)}`);
       console.log(dim(`    replay: bx recipe ${r.name}${r.vars.map((v) => ` '${v}=…'`).join('')}`));
+      // A flow driven one command at a time is not any single batch, so the
+      // newest batch is often not the flow. Show what was done, numbered, so
+      // a wrong pick is fixed in one more command rather than discovered on
+      // replay.
+      if (!flags.last && r.recent && r.recent.length > r.steps) {
+        console.log(`
+  ${mag('▸')} ${dim('recent actions on this site — if the flow is the last N of these, run')} ${bold(`bx learn ${r.name} --last N`)}`);
+        for (const l of r.recent) console.log(`    ${dim(l)}`);
+      }
       return;
     }
 
@@ -556,7 +591,7 @@ async function main() {
       if (!name) die('replay what? bx memo shows the recipes for this site');
       const vars = {};
       for (const kv of args) { const i = kv.indexOf('='); if (i < 0) die(`recipe wants sel=value, got "${kv}"`); vars[kv.slice(0, i)] = kv.slice(i + 1); }
-      const out = await api('POST', '/do', { ...common(), recipe: name, vars, host: flags.host });
+      const out = await api('POST', '/do', { ...common(), recipe: name, vars, host: flags.host, force: !!flags.force });
       process.exit(render(out));
     }
 
@@ -613,14 +648,16 @@ async function main() {
       if (urls.length) {
         const q = args.filter((x) => !/^https?:\/\//i.test(x)).join(' ');
         if (!q) die(`check needs a question — ${bold('bx check "has an Anonymous post option" <url> <url> ...')}`);
-        let yes = 0;
+        let yes = 0, unread = 0;
         const code = await manyUrls('check', '/jev/many', q, urls, { question: q, see: see(), fetch: flags['no-fetch'] ? false : undefined }, (x) => {
           if (x.error) { console.log(`${red('err')}  ${trunc(x.url, 70)}  ${dim(trunc(x.error, 60))}`); return; }
           const a = x.answers[0];
+          if (x.unreadable) { unread++; console.log(`${yel('?? ')}  ${dim(' --')}  ${trunc(x.title || x.url, 58).padEnd(58)} ${dim(`${x.via} ${secs(x.ms)}`)}\n     ${dim(x.url)}\n     ${yel(`unknown — ${x.unreadable}`)}`); return; }
           if (a.answer) yes++;
           console.log(`${a.answer ? grn('yes') : red('no ')}  ${pct(a.answer ? a.p : 1 - (a.p ?? 0))}  ${trunc(x.title || x.url, 58).padEnd(58)} ${dim(`${x.via} ${secs(x.ms)}`)}${eye(x)}\n     ${dim(x.url)}`);
         });
         if (!flags.json && yes) console.log(dim(`${yes} yes in this call`));
+        if (!flags.json && unread) console.log(`  ${mag('▸')} ${yel(`${unread} page${unread > 1 ? 's' : ''} could not be read`)} ${dim('— their answer is unknown, not no. Open one (bx open <url>) to see why: a login wall, an error, or a page that only renders after a click.')}`);
         process.exit(code);
       }
       const q = args.join(' ');
@@ -628,10 +665,66 @@ async function main() {
       const r = await api('POST', '/jev/check', { question: q, tab: common().tab, see: see() });
       if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
       if (!r.ok) die(r.error || 'check failed');
+      if (r.unreadable) {
+        console.log(`${yel('?? ')}  ${dim(`unknown — ${r.unreadable}. Nothing was judged; bx shot or bx read shows what is there.`)}`);
+        process.exit(2);
+      }
       for (const a of r.answers) {
         console.log(`${a.answer ? grn('yes') : red('no ')}  ${trunc(a.question, 60).padEnd(60)} ${pct(a.p === undefined ? a.confidence : (a.answer ? a.p : 1 - a.p))} ${dim(secs(r.ms))}${eye(r)}`);
       }
       process.exit(r.answers.every((a) => a.answer) ? 0 : 1);
+    }
+
+    case 'each': {
+      // Journal per list + instructions: a rerun skips every row already
+      // done or deliberately passed over, and retries the ones that failed.
+      let doActs;
+      if (flags.do !== undefined) {
+        try { doActs = JSON.parse(flags.do); } catch (e) { die(`--do wants a JSON array of actions: ${e.message}`); }
+        if (!Array.isArray(doActs)) doActs = [doActs];
+      }
+      if (!flags.if && !flags.check && !doActs) die(`each needs --if, --check and/or --do — ${bold(`bx each --if "<which rows>" --check "<question about the opened row>" --do '[…{{first}}…]'`)}`);
+      const info = await api('POST', '/do', { ...common(), actions: [{ a: 'info' }] });
+      const here = info.url || '';
+      const key = JSON.stringify([here.split('#')[0], args[0] || '', flags.if || '', flags.check || '', flags.do || '']);
+      const file = flags.out ? path.resolve(flags.out) : path.join(HOME, 'runs', `each-${require('crypto').createHash('sha1').update(key).digest('hex').slice(0, 12)}.jsonl`);
+      const skip = new Set();
+      if (!flags.fresh) {
+        try {
+          for (const l of fs.readFileSync(file, 'utf8').split('\n')) {
+            try { const x = JSON.parse(l); if (x.key && (x.done || x.skip || x.keep === false)) skip.add(x.key); } catch {}
+          }
+        } catch {}
+      }
+      try { fs.mkdirSync(path.dirname(file), { recursive: true }); } catch {}
+      if (skip.size && !flags.json) console.log(dim(`resuming · ${skip.size} rows already handled, in ${file}`));
+      if (flags.dry && !flags.json) console.log(dim('dry run — rows are opened and checked, --do is not run'));
+      const budget = flags.budget === undefined ? 90 : Number(flags.budget);
+      const rows = [];
+      const end = await stream('/each', {
+        tab: common().tab, target: args[0] || flags.target, if: flags.if, check: flags.check, do: doActs,
+        max: num(flags.max), dry: !!flags.dry, see: see(), budget: budget ? budget * 1000 : 0,
+        stopOnError: flags.keepgoing ? false : undefined, skip: [...skip]
+      }, (x) => {
+        delete x.t;
+        rows.push(x);
+        if (!flags.dry) { try { fs.appendFileSync(file, JSON.stringify(x) + '\n'); } catch {} }
+        if (flags.json) return;
+        const who = trunc(x.name || x.href || '?', 44).padEnd(44);
+        const t = x.ms ? dim(secs(x.ms)) : '';
+        if (x.keep === false) console.log(`${dim('pass')}  ${dim(who)} ${dim(`not a match for --if (${Math.round((1 - (x.p ?? 0)) * 100)}% sure)`)}`);
+        else if (x.error) console.log(`${BAD}     ${who} ${red(trunc(x.error, 70))}`);
+        else if (x.skip) console.log(`${yel(x.check?.unknown ? '??  ' : 'skip')}  ${who} ${dim(x.check?.unknown ? `could not tell — ${x.check.why || 'page unreadable'}` : `check said no (${Math.round((1 - (x.check?.p ?? 0)) * 100)}%)`)} ${t}`);
+        else if (x.dry) console.log(`${mag('would')} ${who} ${dim(x.check ? `check yes (${Math.round((x.check.p ?? 0) * 100)}%)` : '')} ${t}`);
+        else if (x.done) console.log(`${OK}     ${who} ${t}`);
+        else console.log(`${grn('match')} ${who} ${x.check ? dim(`check yes (${Math.round((x.check.p ?? 0) * 100)}%)`) : ''} ${t}`);
+      });
+      if (flags.json) { console.log(JSON.stringify({ ...end, journal: file, rows }, null, 2)); process.exit(end.ok ? 0 : 1); }
+      if (end.ok === false && end.error) die(end.error);
+      console.log(dim(`\n${end.did} done · ${end.skipped} skipped · ${end.failed} failed · ${end.rows} opened in ${secs(end.ms || 0)} · journal ${file}`));
+      if (end.stopped === 'budget' || end.stopped === 'max') console.log(`  ${mag('▸')} ${bold('stopped at the ' + (end.stopped === 'budget' ? 'time budget' : '--max limit'))} ${dim('— run the exact same command again to continue; finished rows are skipped')}`);
+      if (end.stopped === 'error') console.log(`  ${mag('▸')} ${yel('stopped at the first failed --do')} ${dim('— fix the batch, then run it again (finished rows are skipped), or add --keepgoing')}`);
+      process.exit(end.ok && !end.failed ? 0 : 1);
     }
 
     case 'items': {

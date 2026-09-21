@@ -20,8 +20,10 @@ const opt = (a) => ({ speed: a.speed, timeout: a.timeout });
 const hit = (el) => {
   // The name travels with the result so memory can say what a click was on
   // ("Pakistan") rather than a ref that means nothing on the next visit.
-  const h = { ref: BX.ref(el), sel: BX.durable(el), name: BX.textOf(el).replace(/\s+/g, ' ').trim().slice(0, 40) || undefined };
+  const name = BX.textOf(el).slice(0, 90);
+  const h = { ref: BX.ref(el, name || undefined), sel: BX.durable(el), name: name.slice(0, 40) || undefined };
   if (!BX.actionable(el)) h.inert = true;
+  if (BX.healed) h.healed = BX.healed;
   const pool = BX.pool;
   if (pool && pool.length > 1 && pool[0] === el && !BX.deliberate) {
     h.n = pool.length;
@@ -217,6 +219,13 @@ A.read = async (a) => {
   else if (mode === 'links') {
     return { links: BX.qsa('a[href]').filter(BX.visible).slice(0, a.max || 300).map((x) => ({ text: x.innerText.replace(/\s+/g, ' ').trim().slice(0, 80), href: x.href })) };
   } else text = toMd(el);
+  // Leave one region out — `bx each` reads a detail pane without the list
+  // beside it, whose rows otherwise answer questions about the open one.
+  if (a.skip) {
+    const out = BX.qsa(a.skip)[0];
+    const t = out && (mode === 'text' ? out.innerText : toMd(out));
+    if (t && t.trim()) text = text.replace(t, '');
+  }
   const cap = a.max || 40000;
   return {
     title: document.title,
@@ -232,9 +241,10 @@ A.elements = async (a) => {
   const seen = new Set();
   const out = [];
   let scanned = 0;
+  const skip = a.skip ? BX.qsa(a.skip)[0] : null;
   for (const el of BX.qsa(sel)) {
     if (++scanned > 6000) break;   // pathological page — report what we have
-    if (seen.has(el) || !BX.visible(el)) continue;
+    if (seen.has(el) || !BX.visible(el) || (skip && skip.contains(el))) continue;
     seen.add(el);
     if (a.viewport !== false && !BX.inView(el)) {
       const r = el.getBoundingClientRect();
@@ -327,6 +337,35 @@ A.items = async (a) => {
   return { url: location.href, title: document.title, n: items.length, of: best.els.length, list: BX.cssPath(best.parent), items };
 };
 
+// Open one item of a list found by `items`, named by its link or by how its
+// text starts. Lists in apps re-render and re-sort after every action — the
+// conversation just replied to jumps to the top — so an index or a ref from
+// the last read points at the wrong row by now. The key does not move.
+A.openitem = async (a) => {
+  const deadline = Date.now() + (a.timeout ?? 4000);
+  for (;;) {
+    const root = a.list ? BX.qsa(a.list)[0] : null;
+    const rows = root ? [...root.children] : [];
+    for (const el of rows) {
+      if (!shown(el)) continue;
+      const link = el.matches('a[href]') ? el : el.querySelector('a[href]');
+      const ok = a.href ? link && link.href === a.href : pieces(el).startsWith(a.head || '\u0000');
+      if (!ok) continue;
+      const tgt = link || el;
+      const r = await BX.clickAt(tgt, { speed: a.speed });
+      return { ...hit(tgt), ...r };
+    }
+    // The list's container itself may have been replaced; a link is a link
+    // wherever it now sits.
+    if (a.href) {
+      const l = BX.qsa('a[href]').find((x) => x.href === a.href && BX.visible(x));
+      if (l) { const r = await BX.clickAt(l, { speed: a.speed }); return { ...hit(l), ...r }; }
+    }
+    if (Date.now() >= deadline) BX.notfound(a.href || a.head || a.list);
+    await BX.sleep(150);
+  }
+};
+
 // Where "the next page of these results" is. rel=next is the honest signal;
 // failing that, the pagination link or button that says next, or ›, or the
 // page number one above the current one.
@@ -377,7 +416,11 @@ A.fetchtext = async (a) => {
   const r = await fetch(a.url, { credentials: 'include', redirect: 'follow' });
   const html = await r.text();
   const doc = new DOMParser().parseFromString(html, 'text/html');
-  doc.querySelectorAll('script, style, noscript, template, svg').forEach((x) => x.remove());
+  // A parsed document has no layout, so toMd cannot tell what is hidden.
+  // Apps park their state in hidden elements — LinkedIn serves each page as
+  // an empty shell plus <code style="display:none"> blocks of API JSON — and
+  // that JSON came back as the "page text" jev then answered from.
+  doc.querySelectorAll('script, style, noscript, template, svg, code, [hidden], [aria-hidden="true"], [style*="display:none"], [style*="display: none"], [style*="visibility:hidden"], [style*="visibility: hidden"]').forEach((x) => x.remove());
   const text = doc.body ? toMd(doc.body) : '';
   return { status: r.status, url: r.url, title: doc.title, len: text.length, text: text.slice(0, a.max || 6000) };
 };

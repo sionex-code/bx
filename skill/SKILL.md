@@ -96,7 +96,7 @@ Almost every browser task is some mix of these. Match the part you are on:
 | "…which of them has / allows / shows Y" | a yes/no per item | `bx check "<Y>" <url> …` on all of them at once |
 | "…and tell me the Z of each" | a value per item | `bx read <url> … --max 1500`, then read off Z |
 | "is the page / button / modal …" (how it looks) | visual | `bx check "<question>" --see` |
-| "do X to each of them" (join, message, post) | an action per item | `bx agent "<goal>"` per item, one at a time; irreversible clicks stop for `--yes` |
+| "do X to each of them" (reply, accept, message, fill) | an action per item | `bx each` — one command for the whole list, see below |
 
 If you notice you are about to run the same command for the fifth time with a
 different URL, stop. There is almost always a single command for the batch.
@@ -145,6 +145,56 @@ yourself is the slow path, and it is exactly what jev exists to replace.
 
 Drive by hand only when you already know the exact element, when the flow
 is one action long, or when jev has handed a decision back to you.
+
+### bx each — the same action on every item of a list
+
+"Reply to every unread message", "accept each pending invite", "fill this
+form for every row": by hand that is open, look, decide, type, send, about
+five of your turns per item. The LinkedIn inbox run spent seven minutes on
+nine conversations that way. `bx each` does it in one command, a few
+seconds per item:
+
+```bash
+# get the list on screen first (a filter, a search), then:
+bx each --if "an unread conversation" \
+  --check "we have not replied yet in the open conversation" \
+  --do '[{"a":"type","target":"text=Write a message…","text":"Hi {{first}}, thanks for reaching out! Please follow our page for new openings.","speed":"instant"},
+         {"a":"click","target":"text=Send"}]' --dry
+```
+```
+would Amir Khan                                   check yes (99%)  3.3s
+skip  Vijay Dhangar                               check said no (96%)  5.3s
+```
+
+It reads the page's list, then for each row:
+
+1. **`--if "<criterion>"`** judges the row from its own text, all rows at once
+   like `sift`. Rows that fail are passed over without opening them.
+2. It **opens the row**, by clicking it in place.
+3. **`--check "<question>"`** is asked about the opened row, with the list
+   itself hidden from jev so other rows cannot answer for it. A `no` or an
+   unknown answer skips the row.
+4. **`--do '<batch>'`** runs with the row's values filled in: `{{name}}` (the
+   row's leading text, e.g. the person), `{{first}}` (first word of it,
+   de-capitalised if it was in all caps), `{{text}}`, `{{href}}`.
+
+The list is re-read before every row, because apps re-sort it as you act,
+and rows are tracked by their link, so none is done twice or skipped.
+
+- **Run it with `--dry` first** when `--do` sends, posts or deletes. `--dry`
+  opens and checks every row but does not run `--do`. Opening can still mark
+  a message as read.
+- Pass the list's CSS as the first argument when bx picks the wrong list:
+  `bx each "ul.conversations" …`.
+- Keep `--check` short and plain. "We have not replied yet in the open
+  conversation" works better than a sentence with two conditions.
+- It stops at the first failed `--do` (`--keepgoing` to carry on), after
+  `--max` rows (default 20), and after `--budget` seconds (default 90).
+  Everything is journalled, so **running the exact same command again
+  continues** where it stopped. Finished and skipped rows are not touched
+  again. `--fresh` starts over.
+- The message is a template. When each row needs its own wording, use
+  `--dry` to list the rows that need it, then write those by hand.
 
 ### bx agent — the whole loop
 
@@ -259,6 +309,15 @@ no   100%  Investment Opportunities in Pakistan for Salaried…   tab 7.2s
 8 of 10 yes · 10 pages in 15.3s · 6 at a time
 ```
 
+A page bx could not actually read, such as a login wall, an error page, a
+loading shell or raw data, answers **`??` unknown**, not `no`. Treat unknown
+as "go and look", never as a no.
+
+Opening a page counts as a visit, and some sites act on that. An inbox
+thread opened this way is marked read, and fifty quick hits on one site can
+get you rate-limited for a while. For items you have to open in an app,
+`bx each` is usually the right tool anyway.
+
 Pages print as they finish. After 75s (`--budget N` to change it, `--budget 0`
 for none) no new pages are started, and the last line says how many are left.
 Run the same command again to continue. Everything done so far is in the
@@ -352,6 +411,14 @@ e4    input    Email address                 412,240
 Then `bx click ref=e3`. Take a screenshot only when the *look* matters,
 or when `els` and `read` leave you genuinely unsure what is on screen.
 
+A ref names one element in one render. Apps like LinkedIn and Gmail rebuild
+their lists after every action. When that happens bx re-finds the element
+by its tag and text and says so (`ref e158 was stale, re-found by its text
+as e170`). When it cannot be sure, it fails at once with the text to target
+instead (`target it as text=…`). Either way you do not need another
+`bx els` between clicks. `text=` targets survive re-renders, so prefer them
+for anything you click more than once.
+
 ## Rule 4 — bx remembers each site; read what it hands you
 
 Every batch teaches the bridge something about the host it ran on: which
@@ -398,6 +465,16 @@ bx forget <what> [host]     # all | notes | traces | traps | selectors | recipe 
 **Do this:** the moment a flow that took real work finally succeeds — a login,
 a multi-step form, a search that needed the right field — run `bx learn <name>`.
 That is the whole point: struggle once, then never again.
+
+If you drove the flow one command at a time, no single batch holds it. `bx
+learn` then prints your recent actions, numbered from the newest. Run `bx
+learn <name> --last N` to keep the last N of them. Steps you took through a
+`ref=` are stored under the durable selector they actually hit, so the
+recipe still works after the page re-renders.
+
+A recipe that has failed every run is marked `broken` in the memory block,
+and `bx recipe` refuses to replay it (`--force` overrides). Redo the flow and
+`bx learn` it again under the same name.
 
 Acting through `ref=e12` still teaches it something. Every element action
 reports the durable selector it actually landed on (`sel` in the result), and
@@ -526,8 +603,12 @@ a cookie banner or modal. Dismiss it and retry.
 
 ## Things that will bite you
 
-- `chrome://` pages, the Chrome Web Store, PDFs and error pages cannot be
-  scripted at all. bx says so in ~20ms; do not retry.
+- `chrome://` pages, the Chrome Web Store and PDFs cannot be scripted at
+  all. bx says so in ~20ms; do not retry.
+- `page failed to load (net::…)` means the tab shows Chrome's error page,
+  whatever its URL says. If the site refused requests after a burst of
+  activity it is rate-limiting you: wait ~30s, then `bx reload`. Reloading
+  the extension, opening new tabs or retrying at once does not help.
 - A bare `host:port` is treated as `http://` on loopback and `https://`
   elsewhere. Pass a full URL when you need the other one.
 - Hidden tabs run at `instant` speed no matter what you ask for — Chrome
