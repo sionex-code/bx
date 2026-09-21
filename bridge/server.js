@@ -655,7 +655,7 @@ async function runBatch(b) {
   let recipe = null;
   if (b.recipe) {
     const host = b.host || (await hostNow());
-    const x = mem.expand(host, b.recipe, b.vars || {}, b.force);
+    const x = mem.expand(b.url ? (mem.hostOf(b.url) || host) : host, b.recipe, b.vars || {}, b.force, b.url);
     if (x.error) throw new HttpError(404, x.error);
     actions = x.actions;
     recipe = { host: x.host, name: b.recipe };
@@ -703,6 +703,7 @@ async function runBatch(b) {
       lastHost = info.host;
       if (recipe) mem.ran(recipe.host, recipe.name, ok, Date.now() - t0);
       if (b.memory !== false && (arrived || !ok)) memory = mem.digest(info.host);
+      if (info.saved) out.learned = info.saved;
     }
   } catch (e) { note('err', { error: 'memory: ' + String(e.message || e) }); }
 

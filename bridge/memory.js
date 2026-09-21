@@ -200,7 +200,7 @@ function redact(a, vars) {
 
 // One line per step, for a human or an agent skimming a flow.
 function brief(a) {
-  const t = selOf(a.target);
+  const t = a.target && typeof a.target === 'object' && a.target.has ? `"${a.target.has}"` : selOf(a.target);
   switch (a.a) {
     case 'nav': case 'newtab': { let s = a.url || ''; try { const u = new URL(s); s = u.host.replace(/^www\./, '') + (u.pathname === '/' ? '' : u.pathname); } catch {} return `${a.a} ${s}`; }
     case 'fill': return `fill ${Object.keys(a.fields || {}).length} fields`;
@@ -337,6 +337,7 @@ function learn(batch) {
   }
   if (!segs.length) return null;
 
+  let saved = null;
   for (const seg of segs) {
     const m = load(seg.host, true);
     if (!m) continue;
@@ -381,9 +382,10 @@ function learn(batch) {
       if (batch.internal || !x.r.ok || !KEEP.has(x.a.a) || x.a.a === 'sleep' || idle(x.a)) continue;
       const a = lasting(x.a, x.r);
       if (!a) continue;
-      m.tail.push({ at: Date.now(), step: redact(a, scope()) });
+      m.tail.push({ at: Date.now(), step: redact(a, scope()), name: x.r.r && x.r.r.name ? String(x.r.r.name).slice(0, 60) : undefined });
     }
     if (m.tail.length > CAP.tail) m.tail.splice(0, m.tail.length - CAP.tail);
+    if (!batch.internal && !saved) saved = repeated(m);
 
     // The flow itself, when the whole segment worked and it did something.
     const allOk = seg.items.every((x) => x.r.ok);
@@ -407,7 +409,86 @@ function learn(batch) {
 
   // The host the batch spent the most actions on is the one worth reporting.
   const main = segs.slice().sort((a, b) => b.items.length - a.items.length)[0];
-  return { host: main.host, hosts: segs.map((s) => s.host), navigated };
+  return { host: main.host, hosts: segs.map((s) => s.host), navigated, saved };
+}
+
+// ── flows repeated page after page ───────────────────────────────────────
+// Posting in six LinkedIn groups was the same dozen steps six times over,
+// each a model turn, and the agent never saved the flow even when asked to.
+// So bx notices by itself: when what was done after opening one page matches
+// what was done after opening the previous page of the same kind
+// (/groups/123/ and /groups/456/), the steps both runs share become a recipe
+// and the next page is one command. Steps only one run had — a toast
+// dismissed once, a request withdrawn — are left out.
+const PAGEVERB = new Set(['nav', 'newtab']);
+const shapeOf = (u) => String(pathOf(u) || '').replace(/\/\d+(?=\/|$)/g, '/:id').replace(/\/[\w-]{16,}(?=\/|$)/g, '/:id');
+const textOf = (t) => { const x = selOf(t); return x.startsWith('text=') ? x.slice(5) : null; };
+const words = (s) => String(s).split(/\s+/);
+
+// Two steps are the same step when they do the same thing to the same
+// control — or to the page's own copy of it: "Join US Stock Market…" and
+// "Join Investment Hub…" are both the page's Join button.
+function sameStep(a, b) {
+  if (a.step.a !== b.step.a) return null;
+  const ta = selOf(a.step.target), tb = selOf(b.step.target);
+  if (ta === tb) return a.step;
+  const xa = textOf(a.step.target) ?? a.name, xb = textOf(b.step.target) ?? b.name;
+  if (!xa || !xb) return null;
+  const wa = words(xa), wb = words(xb);
+  let k = 0;
+  while (k < wa.length && k < wb.length && wa[k].toLowerCase() === wb[k].toLowerCase()) k++;
+  if (!k || k === wa.length || k === wb.length) return null;
+  return { ...a.step, target: { sel: 'button, a, [role=button], [role=link]', has: wa.slice(0, k).join(' ') } };
+}
+
+// Longest common subsequence of the two runs, under sameStep.
+function common(x, y) {
+  const n = x.length, m = y.length;
+  const L = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) {
+    L[i][j] = sameStep(x[i], y[j]) ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  }
+  const out = [];
+  for (let i = 0, j = 0; i < n && j < m;) {
+    const st = sameStep(x[i], y[j]);
+    if (st && L[i][j] === L[i + 1][j + 1] + 1) { out.push(st); i++; j++; }
+    else if (L[i + 1][j] >= L[i][j + 1]) i++; else j++;
+  }
+  return out;
+}
+
+function repeated(m) {
+  const runs = [];
+  for (const t of m.tail) {
+    if (PAGEVERB.has(t.step.a)) runs.push({ nav: t.step, steps: [] });
+    else if (runs.length) runs[runs.length - 1].steps.push(t);
+  }
+  if (runs.length < 2) return null;
+  const cur = runs[runs.length - 1], prev = runs[runs.length - 2];
+  if (!cur.nav.url || cur.nav.url === prev.nav.url || shapeOf(cur.nav.url) !== shapeOf(prev.nav.url)) return null;
+  // A flow worth replaying writes something and then commits it.
+  const wrote = (r) => r.steps.some((t) => t.step.a === 'type' || t.step.a === 'fill' || t.step.a === 'setval');
+  if (!wrote(cur) || !wrote(prev)) return null;
+  const last = cur.steps[cur.steps.length - 1];
+  if (!last || !['click', 'press'].includes(last.step.a)) return null;
+  const shared = common(cur.steps, prev.steps);
+  if (!shared.some((st) => st.a === 'type' || st.a === 'fill' || st.a === 'setval') || shared.length < 2) return null;
+
+  const { steps, vars } = holesOf([{ a: 'nav', url: cur.nav.url }, ...shared]);
+  // One text field is the common case; call its hole what it is.
+  if (vars.length === 1) {
+    const old = HOLE(vars[0].name);
+    for (const st of steps) { if (st.text === old) st.text = HOLE('text'); if (st.value === old) st.value = HOLE('text'); }
+    vars[0].name = 'text';
+  }
+  const seg = (shapeOf(cur.nav.url).split('/').filter((x) => x && x !== ':id')[0] || 'page').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+  const name = `auto-${seg}`;
+  const sig = sigOf(steps);
+  const had = m.recipes[name];
+  // Already known — say it once. The page it opens is not part of the flow.
+  if (had && sigOf(had.steps.slice(1)) === sigOf(steps.slice(1))) return null;
+  m.recipes[name] = { steps, vars, path: pathOf(cur.nav.url), ms: 0, runs: had ? had.runs : 0, ok: had ? had.ok : 0, at: Date.now(), auto: true };
+  return { host: m.host, name, steps: steps.length, vars: vars.map((v) => v.name), flow: sig };
 }
 
 // A recipe that has failed every time it was tried. Replaying it costs a
@@ -527,7 +608,7 @@ function recent(m, n = 12) {
 }
 
 // Fill the holes a recipe left where values used to be.
-function expand(host, name, vars = {}, force) {
+function expand(host, name, vars = {}, force, url) {
   const m = full(host);
   const r = m && m.recipes && m.recipes[name];
   if (!r) return { error: `no recipe "${name}" for ${host}${m ? '' : ' — nothing known about this host'}` };
@@ -558,6 +639,12 @@ function expand(host, name, vars = {}, force) {
     return o;
   });
   if (missing.length) return { error: `recipe "${name}" needs values: ${[...new Set(missing)].map((k) => `"${k}=…"`).join(' ')}` };
+  // The same flow on another page: the recipe's own opening nav goes there
+  // instead, or one is put in front.
+  if (url) {
+    if (actions[0] && PAGEVERB.has(actions[0].a)) actions[0] = { ...actions[0], url };
+    else actions.unshift({ a: 'nav', url });
+  }
   return { host: m.host, name, actions };
 }
 

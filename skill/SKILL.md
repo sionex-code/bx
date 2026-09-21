@@ -97,6 +97,7 @@ Almost every browser task is some mix of these. Match the part you are on:
 | "…and tell me the Z of each" | a value per item | `bx read <url> … --max 1500`, then read off Z |
 | "is the page / button / modal …" (how it looks) | visual | `bx check "<question>" --see` |
 | "do X to each of them" (reply, accept, message, fill) | an action per item | `bx each` — one command for the whole list, see below |
+| "post / apply / submit on each of these pages" | the same flow on page after page | do it by hand on two pages; bx saves it; then `bx recipe <name> <url> 'text=…'` per page |
 
 If you notice you are about to run the same command for the fifth time with a
 different URL, stop. There is almost always a single command for the batch.
@@ -203,6 +204,45 @@ and rows are tracked by their link, so none is done twice or skipped.
   again. `--fresh` starts over.
 - The message is a template. When each row needs its own wording, use
   `--dry` to list the rows that need it, then write those by hand.
+
+### The same flow on page after page
+
+Posting in six groups, applying to five jobs, filling the same form on
+several sites: the flow is identical and only the page and the text change.
+Done by hand it is about twelve commands per page. A LinkedIn run spent 11
+minutes posting in six groups that way.
+
+Do it by hand on the first two pages. When the second one finishes, bx
+compares the two and saves the steps they had in common as a recipe. It
+leaves out steps only one page needed, like a popup, and treats buttons that
+name the page ("Join US Stock Market…" and "Join Investment Hub…") as the
+same button:
+
+```
+  ▸ saved  you did the same flow on two pages, so bx kept it as recipe auto-groups
+    nav linkedin.com/groups/12274630 → click "Join" → click text=Start a public post → … → click text=Post
+    every next page, one command: bx recipe auto-groups <url> 'text=…'
+```
+
+From then on each page is one command, under a second of browser time:
+
+```bash
+bx recipe auto-groups https://www.linkedin.com/groups/44059/ 'text=What is one investing idea you wish you had learned earlier?'
+```
+
+If a page differs (an extra welcome dialog, a join that needs approval), the
+recipe stops at the step that failed and says which one. Handle that page by
+hand and carry on with the recipe for the next.
+
+Write each page's text yourself when it should differ. Passing a different
+`text=` per page is the only thing the recipe needs from you.
+
+**Some things a page cannot tell you before you act.** Whether a group lets
+you join without approval only shows after you click Join ("request sent").
+Do not spend `bx check` calls asking; click, and move on if it was a request.
+
+**If the user asks how long it took, do not estimate.** Run `date` when you
+start and when you finish, and report the difference.
 
 ### bx agent — the whole loop
 
@@ -469,6 +509,9 @@ bx learn <name>             # name the flow you just ran, so it is one command n
 bx note "<one line>"        # a fact a selector or URL cannot express, ≤160 chars
 bx forget <what> [host]     # all | notes | traces | traps | selectors | recipe <name>
 ```
+
+bx saves a flow you repeat on two pages of the same kind by itself (see "The
+same flow on page after page"). Everything else is up to you.
 
 **Do this:** the moment a flow that took real work finally succeeds — a login,
 a multi-step form, a search that needed the right field — run `bx learn <name>`.

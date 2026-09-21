@@ -173,10 +173,19 @@ function nudge(out) {
     const now = Date.now();
     let host = '';
     try { host = new URL(out.url || '').host; } catch {}
-    trail = trail.filter((x) => now - x.at < 180000).concat(host ? [{ host, at: now }] : []).slice(-10);
+    let where = '';
+    try { where = new URL(out.url || '').pathname.replace(/\/(thread|conversation|messages?)\/.*$/, ''); } catch {}
+    trail = trail.filter((x) => now - x.at < 180000).concat(host ? [{ host, where, at: now }] : []).slice(-10);
     try { fs.writeFileSync(file, JSON.stringify(trail)); } catch {}
-    if (host && trail.filter((x) => x.host === host).length >= 2) {
+    const mine = trail.filter((x) => x.host === host);
+    // Same page again (an inbox, a list with a detail pane): that is a list
+    // to walk. A new page each time (a group, a profile): that is a flow to
+    // replay, which bx saves on its own once it has seen it twice.
+    if (host && mine.length >= 2 && mine[mine.length - 1].where === mine[mine.length - 2].where) {
       return `jev: doing the same thing to one item after another — ${bold(`bx each --if "<which rows>" --check "<question about the open row>" --do '[…{{first}}…]'`)} runs the whole list in one command`;
+    }
+    if (host && mine.length >= 1 && !out.learned) {
+      return `jev: if you will do this on more pages, finish it once more on the next page — bx then saves the flow and every page after is ${bold(`bx recipe <name> <url> 'text=…'`)}`;
     }
   }
   // Scroll, sleep, scroll, sleep, then items: the Facebook run did that 18
@@ -206,7 +215,12 @@ function render(out) {
   }
   if ((out.results || []).length > 1) console.log(dim(`${DOT} ${out.results.length} actions in ${out.ms}ms  tab ${out.tab}`));
   if (out.memory) recall(out.memory);
-  if (hint) console.log(`\n  ${mag('▸')} ${dim(hint)}`);
+  if (out.learned) {
+    const l = out.learned;
+    console.log(`\n  ${mag('▸ saved')} ${dim('you did the same flow on two pages, so bx kept it as recipe')} ${bold(l.name)}`);
+    console.log(`    ${dim(l.flow)}`);
+    console.log(`    ${dim('every next page, one command:')} ${bold(`bx recipe ${l.name} <url>${l.vars.map((v) => ` '${v}=…'`).join('')}`)}`);
+  } else if (hint) console.log(`\n  ${mag('▸')} ${dim(hint)}`);
   return out.ok ? 0 : 1;
 }
 
@@ -391,7 +405,7 @@ ${bold('tabs')}
 ${bold('memory')}  ${dim('bx learns every site as you drive it — flows, selectors, traps')}
   memo [host]                 everything known about a site   ${dim('--all to list sites')}
   learn <name>                name the flow you just ran      ${dim('--last N: your last N actions, across commands')}
-  recipe <name> [var=val...]  replay it            ${dim('bx memo names the vars')}
+  recipe <name> [url] [var=val...]  replay it, optionally on another page  ${dim('bx memo names the vars')}
   note <text>                 remember something about this site
   forget [what] [host]        ${dim('all | notes | traces | traps | selectors | recipe <name>')}
 
@@ -591,8 +605,10 @@ async function main() {
       const name = args.shift();
       if (!name) die('replay what? bx memo shows the recipes for this site');
       const vars = {};
-      for (const kv of args) { const i = kv.indexOf('='); if (i < 0) die(`recipe wants sel=value, got "${kv}"`); vars[kv.slice(0, i)] = kv.slice(i + 1); }
-      const out = await api('POST', '/do', { ...common(), recipe: name, vars, host: flags.host, force: !!flags.force });
+      // A URL runs the flow on that page instead of the one it was learned on.
+      const url = args.length && /^https?:\/\//i.test(args[0]) ? args.shift() : undefined;
+      for (const kv of args) { const i = kv.indexOf('='); if (i < 0) die(`recipe wants name=value, got "${kv}"`); vars[kv.slice(0, i)] = kv.slice(i + 1); }
+      const out = await api('POST', '/do', { ...common(), recipe: name, vars, url, host: flags.host, force: !!flags.force });
       process.exit(render(out));
     }
 
