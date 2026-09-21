@@ -214,7 +214,17 @@ function render(out) {
     detail(r.a, r.r);
   }
   if ((out.results || []).length > 1) console.log(dim(`${DOT} ${out.results.length} actions in ${out.ms}ms  tab ${out.tab}`));
-  if (out.memory) recall(out.memory);
+  if (out.memory) {
+    // The briefing is worth reading once. Reprinted on every failure it was
+    // 40k characters of the same lines in one LinkedIn run — context an agent
+    // pays for on every turn after. Within 15 minutes of showing a host, a
+    // failure gets only the lines about what just failed.
+    if (seenRecently(out.memory.host)) {
+      const bad = (out.results || []).filter((r) => !r.ok).map((r) => String(r.error || ''));
+      const hits = [...(out.memory.avoid || []), ...(out.memory.traps || [])].filter((l) => bad.some((e) => e && l && (e.includes(l.split(' ')[0]) || l.includes((e.match(/not found: "?([^"]+)"?/) || [])[1] || '\u0000'))));
+      if (hits.length) { console.log(`\n  ${mag('▸ memory')} ${bold(out.memory.host)}`); for (const h of hits.slice(0, 3)) console.log(`    ${yel(h)}`); }
+    } else recall(out.memory);
+  }
   if (out.learned) {
     const l = out.learned;
     console.log(`\n  ${mag('▸ saved')} ${dim('you did the same flow on two pages, so bx kept it as recipe')} ${bold(l.name)}`);
@@ -222,6 +232,16 @@ function render(out) {
     console.log(`    ${dim('every next page, one command:')} ${bold(`bx recipe ${l.name} <url>${l.vars.map((v) => ` '${v}=…'`).join('')}`)}`);
   } else if (hint) console.log(`\n  ${mag('▸')} ${dim(hint)}`);
   return out.ok ? 0 : 1;
+}
+
+function seenRecently(host) {
+  const file = path.join(HOME, 'recalled.json');
+  let seen = {};
+  try { seen = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+  const now = Date.now();
+  const recent = seen[host] && now - seen[host] < 15 * 60000;
+  if (!recent) { seen[host] = now; try { fs.writeFileSync(file, JSON.stringify(seen)); } catch {} }
+  return recent;
 }
 
 // What bx already knows about this site. It arrives unasked on arrival and on
@@ -323,8 +343,11 @@ function detail(a, r) {
     console.log(`  ${dim('also')} ${yel(o.ref.padEnd(5))} ${trunc(o.css, 88)}${o.dis ? red(' disabled') : ''}`);
   }
   if (a === 'read' && r.text) console.log('\n' + r.text + '\n');
-  if (a === 'elements') for (const e of r.elements) {
-    console.log(`  ${yel(e.ref.padEnd(5))} ${dim(e.tag.padEnd(8))} ${trunc(e.name || '', 58).padEnd(58)} ${dim(`${e.box[0]},${e.box[1]}`)}${e.dis ? red(' disabled') : ''}`);
+  if (a === 'elements') {
+    for (const e of r.elements) {
+      console.log(`  ${yel(e.ref.padEnd(5))} ${dim(e.tag.padEnd(8))} ${trunc(e.name || '', 58).padEnd(58)} ${dim(`${e.box[0]},${e.box[1]}`)}${e.dis ? red(' disabled') : ''}`);
+    }
+    if (r.n >= 60 && !flags.max) console.log(dim(`  … stopped at 60 — bx els "<css of the part you want>", bx pick "<what you want>", or --max N`));
   }
   if (a === 'tabs') for (const t of r.tabs) {
     console.log(`  ${(t.active ? grn('▸') : ' ')} ${yel(String(t.id).padEnd(6))} ${trunc(t.title, 46).padEnd(46)} ${dim(t.url)}`);
@@ -838,8 +861,10 @@ async function main() {
         if (u1 && u1 !== u0) console.log(`  ${mag('→')} ${dim('now at')} ${u1}`);
         if (fresh.length) {
           console.log(`  ${mag('+')} ${dim(`${fresh.length} new on screen:`)}`);
-          for (const e of fresh.slice(0, 15)) console.log(`    ${yel(e.ref.padEnd(5))} ${dim((e.tag || '').padEnd(8))} ${trunc(e.name, 70)}`);
-          if (fresh.length > 15) console.log(dim(`    … ${fresh.length - 15} more — bx els`));
+          // A navigation "adds" the whole next page; listing 77 of those
+          // is a page dump in disguise. The first few say what opened.
+          for (const e of fresh.slice(0, 8)) console.log(`    ${yel(e.ref.padEnd(5))} ${dim((e.tag || '').padEnd(8))} ${trunc(e.name, 60)}`);
+          if (fresh.length > 8) console.log(dim(`    … ${fresh.length - 8} more — bx els "<css>" or bx pick "<what you want>"`));
         } else if (!(u1 && u1 !== u0)) console.log(`  ${dim(gone > 0 ? `${gone} elements went away, nothing new appeared` : 'no visible change — nothing opened and the URL did not move')}`);
       }
       process.exit(code);
@@ -894,7 +919,9 @@ async function main() {
       }
       return settled([{ a: 'read', target: target(), mode: flags.mode, max: num(flags.max) }]);
     }
-    case 'els': case 'elements': return settled([{ a: 'elements', filter: args[0] || flags.filter, max: num(flags.max) }]);
+    // 60 by default: a LinkedIn page lists 150, most of them the site's own
+    // header and sidebars, and agents re-ran it after every click.
+    case 'els': case 'elements': return settled([{ a: 'elements', filter: args[0] || flags.filter, max: num(flags.max) || 60 }]);
     case 'exists': return run([{ a: 'exists', target: target(), timeout: num(flags.timeout) ?? 0 }]);
 
     case 'shot': case 'screenshot':
