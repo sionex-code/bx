@@ -345,7 +345,9 @@ function summary(a, r) {
   // Never shorten a URL. A caller reads filters and ids out of it, and they
   // sit at the end: Fiverr's seller-country filter was the part cut off.
   if (r.url) return dim(r.url);
-  if (r.at) return dim(`@ ${r.at[0]},${r.at[1]}${r.trusted ? mag(' trusted') : ''}${r.covered ? yel(' covered') : ''}`);
+  // Name what was clicked. "@ 1124,298 · 6 matched" hid five clicks on a
+  // post's menu button that were meant for a submit button.
+  if (r.at) return dim(`@ ${r.at[0]},${r.at[1]}${r.trusted ? mag(' trusted') : ''}${r.covered ? yel(' covered') : ''}`) + (r.name ? ` ${dim('→')} "${trunc(r.name, 50)}"` : '');
   // eval's value is the answer, not a status line. Cut to 110 characters, a
   // LinkedIn run re-read one post in 150-character slices for two minutes.
   if (a === 'eval' && r.value !== undefined) return '';

@@ -192,6 +192,16 @@ const attrHit = (el, want) => {
   return false;
 };
 
+// One word is too little to match by containment. On LinkedIn, text=Post
+// found no "Post" button (it says "Comment" there) and clicked "Open control
+// menu for post by …" instead, five times, reporting ok. A single-word target
+// only matches that word whole, in a label barely longer than the word itself.
+const looseWord = (n, w) => {
+  if (n.length > w.length + 20) return false;
+  const esc = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^\\p{L}\\p{N}])${esc}([^\\p{L}\\p{N}]|$)`, 'u').test(n);
+};
+
 BX.byText = (want) => {
   if (!want) return [];
   const exact = [], part = [], seen = new Set();
@@ -205,7 +215,7 @@ BX.byText = (want) => {
     const n = norm(BX.textOf(el));
     if (!n) return;
     if (n === want) exact.push(el);
-    else if (n.includes(want) && n.length < want.length + 90) part.push(el);
+    else if (n.includes(want) && n.length < want.length + 90 && (want.includes(' ') || looseWord(n, want))) part.push(el);
   };
   // textContent is layout-free and already concatenates inline children, so it
   // is a safe gate in front of the innerText + visibility check.
