@@ -132,6 +132,10 @@ BX.textOf = (el) => {
     el.getAttribute?.('alt') ||
     el.getAttribute?.('placeholder') ||
     el.getAttribute?.('name') ||
+    // An icon link: Hacker News' upvote arrow is an <a> around a <div
+    // title="upvote">. Without this it is a nameless link, and a nameless
+    // link on a list page looks like the list item itself.
+    (() => { const c = el.querySelector?.('[aria-label],[title],img[alt],svg title'); return c && (c.getAttribute('aria-label') || c.getAttribute('title') || c.getAttribute('alt') || c.textContent); })() ||
     '';
   return String(t).replace(/\s+/g, ' ').trim();
 };
@@ -533,6 +537,19 @@ BX.region = (el) => {
     if (tag === 'MAIN' || tag === 'ARTICLE' || role === 'main' || id === 'content' || id === 'main' || id === 'mw-content-text') return 'main content';
   }
   return undefined;
+};
+
+// The heading an element sits under: the nearest h1–h6 before it, walking out
+// through its ancestors. "Early Netherlandish painting" is just a link;
+// under "From today's featured article" it is the answer.
+BX.section = (el) => {
+  for (let n = el, d = 0; n && n !== document.body && d < 8; n = n.parentElement, d++) {
+    for (let s = n.previousElementSibling, k = 0; s && k < 12; s = s.previousElementSibling, k++) {
+      const hs = /^H[1-6]$/.test(s.tagName) ? [s] : s.querySelectorAll('h1,h2,h3,h4,h5,h6');
+      const h = hs[hs.length - 1];
+      if (h) return h.innerText.replace(/\s+/g, ' ').trim().slice(0, 60) || undefined;
+    }
+  }
 };
 
 BX.describe = (el) => { const name = BX.textOf(el).slice(0, 90) || undefined; return {

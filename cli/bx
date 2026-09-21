@@ -308,7 +308,7 @@ function agentEnd(out) {
   console.log(`\n${mark}  ${dim(out.detail || '')}`);
   const st = out.steps || [];
   const think = st.reduce((a, x) => a + (x.decided?.ms || 0), 0);
-  console.log(dim(`${DOT} ${st.length} steps · brain ${out.brain}${think ? ` · ${secs(think)} deciding` : ''}`));
+  console.log(dim(`${DOT} ${st.length} steps · brain ${out.brain}${think ? ` · ${secs(think)} deciding` : ''}${out.ms ? ` · ${secs(out.ms)} total` : ''}`));
 
   // The escalation. bx stopped because it was not sure enough, so the thing
   // that called bx — a bigger model, or a person — gets the page as jev saw it
@@ -340,7 +340,7 @@ function summary(a, r) {
   if (!r || typeof r !== 'object') return dim(String(r ?? ''));
   if (r.path) return `${blu(r.path)} ${dim(`${(r.bytes / 1024).toFixed(0)}kb`)}`;
   if (r.inline) return dim(`${(r.bytes / 1024).toFixed(0)}kb base64 inline`);
-  if (a === 'read') return `${dim(trunc(r.title, 50))} ${dim(`${r.len} chars`)}`;
+  if (a === 'read') return r.links ? dim(`${r.links.length} links`) : `${dim(trunc(r.title, 50))} ${dim(`${r.len} chars`)}`;
   if (a === 'elements') return dim(`${r.n} elements`);
   if (a === 'tabs') return dim(`${r.n} tabs`);
   if (a === 'fill') return `${r.filled}/${r.of} fields`;
@@ -883,7 +883,23 @@ async function main() {
         { a: 'info' }, { a: 'elements', max: 300 }, ...scoped([act]),
         { a: 'wait', settle: true, quiet: 250, timeout: 2500 }, { a: 'info' }, { a: 'elements', max: 300 }
       ] });
-      const [i0, e0, did, , i1, e1] = out.results || [];
+      let [i0, e0, did, , i1, e1] = out.results || [];
+      // A link to a big page (Wikipedia's Pakistan article) is still loading
+      // when the settle wait ends, so the "after" look was taken of the page
+      // being left: bx said "the URL did not move", the model clicked again,
+      // and the stale ref landed on the next page's "Division" link.
+      if (did?.ok && did.r?.hit === 'a' && i1?.r?.url === i0?.r?.url) {
+        for (const end = Date.now() + 3000; Date.now() < end;) {
+          await new Promise((r) => setTimeout(r, 200));
+          const i = (await api('POST', '/do', { ...common(), actions: [{ a: 'info' }] })).results?.[0];
+          if (i?.ok && i.r?.url && i.r.url !== i0?.r?.url) {
+            const more = (await api('POST', '/do', { ...common(), stopOnError: false, actions: [
+              { a: 'wait', settle: true, quiet: 250, timeout: 2500 }, { a: 'elements', max: 300 }] })).results || [];
+            i1 = i; e1 = more[1];
+            break;
+          }
+        }
+      }
       const before = new Set((e0?.r?.elements || []).map((e) => `${e.ref}|${e.name || ''}`));
       const fresh = (e1?.r?.elements || []).filter((e) => !before.has(`${e.ref}|${e.name || ''}`) && e.name);
       const gone = (e0?.r?.elements || []).length - (e1?.r?.elements || []).length + fresh.length;
@@ -960,7 +976,8 @@ async function main() {
         const code = await manyUrls('read', '/many/read', `${flags.mode || 'md'}|${flags.max || ''}`, urls, { mode: flags.mode, max: num(flags.max), fetch: flags['no-fetch'] ? false : undefined }, (x) => {
           if (x.error) { console.log(`\n${red('═══ err')} ${x.url}  ${dim(trunc(x.error, 60))}`); return; }
           console.log(`\n${bold('═══')} ${bold(trunc(x.title || '', 70))}  ${dim(`${x.via} ${secs(x.ms)}`)}\n${dim(x.url)}\n`);
-          console.log(x.text);
+          if (x.links) for (const l of x.links) console.log(`  ${trunc(l.text, 44).padEnd(44)} ${dim(l.href)}`);
+          else console.log(x.text);
         });
         process.exit(code);
       }

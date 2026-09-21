@@ -336,8 +336,10 @@ function prose(text) {
 async function grab(url, b, need = {}) {
   const host = new URL(url).host;
   const noop = () => {};
-  if (b.fetch !== false && !need.shot && PROBE.has(host)) { try { await PROBE.get(host); } catch {} }
-  if (b.fetch !== false && !need.shot && !SHELL.has(host)) {
+  // The fetch shortcut only ever yields prose, so a links read needs the tab.
+  const fetchable = b.fetch !== false && !need.shot && need.mode !== 'links';
+  if (fetchable && PROBE.has(host)) { try { await PROBE.get(host); } catch {} }
+  if (fetchable && !SHELL.has(host)) {
     let settle;
     if (!PROBE.has(host)) PROBE.set(host, new Promise((r) => { settle = r; }));
     try {
@@ -368,7 +370,7 @@ async function grab(url, b, need = {}) {
     id = r[0]?.r?.id ?? r[0]?.tab;
     if (!r[0]?.ok) throw new Error(r[0]?.error || 'could not open');
     const img = need.shot && r[4]?.r?.inline ? `data:${r[4].r.mime || 'image/jpeg'};base64,${r[4].r.inline}` : null;
-    return { via: 'tab', id, url: r[0].r.url || url, title: r[2]?.r?.title, text: r[2]?.r?.text || '', els: r[3]?.r?.elements || [], img, done };
+    return { via: 'tab', id, url: r[0].r.url || url, title: r[2]?.r?.title, text: r[2]?.r?.text || '', links: r[2]?.r?.links, els: r[3]?.r?.elements || [], img, done };
   } catch (e) { await done(); throw e; }
 }
 
@@ -1025,7 +1027,7 @@ const server = http.createServer(async (req, res) => {
       return manyReply(res, b, urls, async (u) => {
         const t1 = Date.now();
         const g = await grab(u, b, { mode: b.mode || 'md', max: b.max || 4000 });
-        try { return { url: g.url, asked: u, title: g.title, via: g.via, text: g.text, ms: Date.now() - t1 }; } finally { await g.done(); }
+        try { return { url: g.url, asked: u, title: g.title, via: g.via, text: g.text, links: g.links, ms: Date.now() - t1 }; } finally { await g.done(); }
       });
     }
 
@@ -1041,9 +1043,6 @@ const server = http.createServer(async (req, res) => {
         jevConfig: { ...CFG.jev, see: seeMode(b), ...(b.min_confidence ? { min_confidence: b.min_confidence } : {}) }
       };
       if (!b.goal) throw new HttpError(400, 'agent needs a goal');
-
-      // What bx already learned about this site is free context for the brain.
-      try { const h = await hostNow(); if (h) { const d = mem.digest(h); if (d) opts.memory = JSON.stringify(d).slice(0, 900); } } catch {}
 
       // Streaming exists because an agent run is seconds of silence otherwise,
       // and the one thing you want to watch is what it decided and why.
