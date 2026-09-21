@@ -227,6 +227,18 @@ async function collect(b, onPage) {
       r = look.results[1];
       if (!feed || !r?.ok || (r.r.items || []).some((x) => x.href && !seenHref.has(x.href))) break;
     }
+    // Apps fill their lists in after the page reports loaded: LinkedIn's
+    // inbox showed its conversations ~4s after `bx open` returned, and a
+    // single read in that window found no list and gave up.
+    for (let late = 0; n === 1 && late < 8 && (!r?.ok || !r.r.items?.length); late++) {
+      await new Promise((ok) => setTimeout(ok, 1000));
+      look = await runBatch({ tab, memory: false, stopOnError: false, actions: [
+        { a: 'items', target: b.target, max: cap, chars: b.chars || 400 },
+        ...(n < want ? [{ a: 'nextpage' }] : [])
+      ] });
+      look.results.unshift(null);   // keep the [wait, items, nextpage] shape
+      r = look.results[1];
+    }
     if (!r?.ok) { if (n === 1) throw new HttpError(502, `could not read a list off this page: ${r?.error || 'no result'}`); break; }
     // A site that loops back to page one, or a "next" that did nothing.
     const key = (r.r.items || []).map((x) => x.href || x.text).join('|');
@@ -497,6 +509,12 @@ async function each(b, emit) {
       if (!empty() && got.r.items.some((x) => seen.has(keyOf(x)))) list = got.r.list;
       else got = null;
     }
+    // First read: the list may still be arriving (see collect).
+    for (let late = 0; !home && late < 8 && empty(); late++) {
+      await new Promise((ok) => setTimeout(ok, 1000));
+      look = await runBatch({ tab, memory: false, stopOnError: false, actions: [{ a: 'items', target: list || undefined, max: 80, chars: 300, timeout: 1500 }] });
+      got = look.results[0];
+    }
     if (!got?.ok || !got.r.items?.length) {
       if (!home) throw new Error(`no list found on this page${list ? ` at ${list}` : ''} — point bx each at it: bx each "<css of the list>" …`);
       break;
@@ -504,6 +522,15 @@ async function each(b, emit) {
     if (!list) list = got.r.list;
     if (!home) home = got.r.url;
 
+    // Literal rules are applied literally. Asked "is the newest message from
+    // them, not Admin (You)" about the real LinkedIn inbox, jev got 5 of 20
+    // rows wrong and changed its mind between runs; a substring test cannot.
+    const low = (t) => String(t || '').toLowerCase();
+    const literal = (x) => [].concat(b.with || []).every((w) => low(x.text).includes(low(w))) &&
+      ![].concat(b.without || []).some((w) => low(x.text).includes(low(w)));
+    for (const x of got.r.items) {
+      if (!seen.has(keyOf(x)) && !literal(x)) { seen.add(keyOf(x)); emit({ key: keyOf(x), name: x.text.split(' · ')[0], href: x.href, keep: false, by: 'text' }); }
+    }
     const fresh = got.r.items.filter((x) => !seen.has(keyOf(x)));
     if (!fresh.length) break;
     if (b.if) {
@@ -512,6 +539,18 @@ async function each(b, emit) {
         const judged = await judge({ criterion: b.if, tab, see: b.see }, { url: got.r.url, title: got.r.title, items: todo });
         for (const x of judged) verdict.set(keyOf(x), x);
       }
+    }
+    // Nothing to open: the whole answer is on this one read of the list.
+    if (!b.check && !b.do) {
+      for (const x of fresh) {
+        const v = verdict.get(keyOf(x));
+        seen.add(keyOf(x));
+        if (b.if && !v?.keep) { emit({ key: keyOf(x), name: x.text.split(' · ')[0], href: x.href, keep: false, p: v?.p }); continue; }
+        if (rows >= max) break;
+        rows++; did++;
+        emit({ key: keyOf(x), n: rows, name: x.text.split(' · ')[0], href: x.href, keep: b.if ? true : undefined, p: v?.p, listed: true, ms: 0 });
+      }
+      break;
     }
     const next = fresh.find((x) => !b.if || verdict.get(keyOf(x))?.keep);
     // Rows that fail --if are reported once, then left alone.
@@ -529,7 +568,7 @@ async function each(b, emit) {
     const r0 = Date.now();
 
     // Nothing to look at and nothing to do: --if alone is a dry listing.
-    if (!b.check && !b.do) { emit({ ...row, ms: 0 }); did++; continue; }
+    if (!b.check && !b.do) { emit({ ...row, listed: true, ms: 0 }); did++; continue; }
 
     const open = await runBatch({ tab, memory: false, stopOnError: false, actions: [
       { a: 'openitem', list, href: next.href, head: next.href ? undefined : name, timeout: 4000 },
@@ -870,7 +909,7 @@ const server = http.createServer(async (req, res) => {
     // LinkedIn inbox run spent seven minutes on nine conversations.
     if (route === '/each' && req.method === 'POST') {
       const b = await body(req);
-      if (!b.if && !b.check && !b.do) throw new HttpError(400, 'each needs something to do: --if, --check and/or --do');
+      if (!b.if && !b.check && !b.do && !b.with && !b.without) throw new HttpError(400, 'each needs something to do: --with/--without, --if, --check and/or --do');
       if (b.do && !Array.isArray(b.do)) throw new HttpError(400, 'each --do takes a JSON array of actions');
       res.writeHead(200, { 'content-type': 'application/x-ndjson', 'cache-control': 'no-store' });
       const line = (x) => { try { res.write(JSON.stringify(x) + '\n'); } catch {} };

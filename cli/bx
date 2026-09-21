@@ -122,7 +122,7 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a.startsWith('--')) {
     const [k, v] = a.slice(2).split('=');
-    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out', 'last', 'if', 'check', 'do'].includes(k) ? argv[++i] : true) : v;
+    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out', 'last', 'if', 'check', 'do', 'with', 'without'].includes(k) ? argv[++i] : true) : v;
   } else args.push(a);
 }
 const num = (v) => (v === undefined ? undefined : Number(v));
@@ -355,7 +355,8 @@ ${bold('agent')}  ${dim('jev decides the next move from the live page — on by 
   sift <criterion>            judge every item in the page's list at once  ${dim('--pages N --all --max N --target SEL')}
   items [target]              the page's repeated list (results, cards, rows) as items, no model  ${dim('--pages N')}
   each [list] --if C --check Q --do '[…]'
-                              for every row of the list: keep rows matching C (from their text),
+                              for every row of the list: keep rows matching C (from their text;
+                              ${dim('--with T / --without T for an exact text rule')}),
                               open each, ask Q about it, run the batch if yes  ${dim('{{name}} {{first}} {{text}} {{href}}')}
                               ${dim('--dry  --max N (20)  --budget S (90)  --keepgoing  --fresh')}
   jev [key|on|off|model|set|ask]
@@ -683,16 +684,16 @@ async function main() {
         try { doActs = JSON.parse(flags.do); } catch (e) { die(`--do wants a JSON array of actions: ${e.message}`); }
         if (!Array.isArray(doActs)) doActs = [doActs];
       }
-      if (!flags.if && !flags.check && !doActs) die(`each needs --if, --check and/or --do — ${bold(`bx each --if "<which rows>" --check "<question about the opened row>" --do '[…{{first}}…]'`)}`);
+      if (!flags.if && !flags.check && !doActs && !flags.with && !flags.without) die(`each needs --if, --check and/or --do — ${bold(`bx each --if "<which rows>" --check "<question about the opened row>" --do '[…{{first}}…]'`)}`);
       const info = await api('POST', '/do', { ...common(), actions: [{ a: 'info' }] });
       const here = info.url || '';
-      const key = JSON.stringify([here.split('#')[0], args[0] || '', flags.if || '', flags.check || '', flags.do || '']);
+      const key = JSON.stringify([here.split('#')[0], args[0] || '', flags.if || '', flags.check || '', flags.do || '', flags.with || '', flags.without || '']);
       const file = flags.out ? path.resolve(flags.out) : path.join(HOME, 'runs', `each-${require('crypto').createHash('sha1').update(key).digest('hex').slice(0, 12)}.jsonl`);
       const skip = new Set();
       if (!flags.fresh) {
         try {
           for (const l of fs.readFileSync(file, 'utf8').split('\n')) {
-            try { const x = JSON.parse(l); if (x.key && (x.done || x.skip || x.keep === false)) skip.add(x.key); } catch {}
+            try { const x = JSON.parse(l); if (x.key && (x.done || x.skip || (x.keep === false && x.by !== 'text'))) skip.add(x.key); } catch {}
           }
         } catch {}
       }
@@ -703,16 +704,17 @@ async function main() {
       const rows = [];
       const end = await stream('/each', {
         tab: common().tab, target: args[0] || flags.target, if: flags.if, check: flags.check, do: doActs,
+        with: typeof flags.with === 'string' ? flags.with : undefined, without: typeof flags.without === 'string' ? flags.without : undefined,
         max: num(flags.max), dry: !!flags.dry, see: see(), budget: budget ? budget * 1000 : 0,
         stopOnError: flags.keepgoing ? false : undefined, skip: [...skip]
       }, (x) => {
         delete x.t;
         rows.push(x);
-        if (!flags.dry) { try { fs.appendFileSync(file, JSON.stringify(x) + '\n'); } catch {} }
+        if (!flags.dry && (flags.check || doActs)) { try { fs.appendFileSync(file, JSON.stringify(x) + '\n'); } catch {} }
         if (flags.json) return;
         const who = trunc(x.name || x.href || '?', 44).padEnd(44);
         const t = x.ms ? dim(secs(x.ms)) : '';
-        if (x.keep === false) console.log(`${dim('pass')}  ${dim(who)} ${dim(`not a match for --if (${Math.round((1 - (x.p ?? 0)) * 100)}% sure)`)}`);
+        if (x.keep === false) console.log(`${dim('pass')}  ${dim(who)} ${dim(x.by === 'text' ? 'filtered out by --with/--without' : `not a match for --if (${Math.round((1 - (x.p ?? 0)) * 100)}% sure)`)}`);
         else if (x.error) console.log(`${BAD}     ${who} ${red(trunc(x.error, 70))}`);
         else if (x.skip) console.log(`${yel(x.check?.unknown ? '??  ' : 'skip')}  ${who} ${dim(x.check?.unknown ? `could not tell — ${x.check.why || 'page unreadable'}` : `check said no (${Math.round((1 - (x.check?.p ?? 0)) * 100)}%)`)} ${t}`);
         else if (x.dry) console.log(`${mag('would')} ${who} ${dim(x.check ? `check yes (${Math.round((x.check.p ?? 0) * 100)}%)` : '')} ${t}`);
@@ -721,7 +723,10 @@ async function main() {
       });
       if (flags.json) { console.log(JSON.stringify({ ...end, journal: file, rows }, null, 2)); process.exit(end.ok ? 0 : 1); }
       if (end.ok === false && end.error) die(end.error);
-      console.log(dim(`\n${end.did} done · ${end.skipped} skipped · ${end.failed} failed · ${end.rows} opened in ${secs(end.ms || 0)} · journal ${file}`));
+      const listing = !flags.check && !doActs;
+      console.log(dim(listing
+        ? `\n${end.did} rows match · nothing was opened · ${secs(end.ms || 0)}`
+        : `\n${end.did} done · ${end.skipped} skipped · ${end.failed} failed · ${end.rows} opened in ${secs(end.ms || 0)} · journal ${file}`));
       if (end.stopped === 'budget' || end.stopped === 'max') console.log(`  ${mag('▸')} ${bold('stopped at the ' + (end.stopped === 'budget' ? 'time budget' : '--max limit'))} ${dim('— run the exact same command again to continue; finished rows are skipped')}`);
       if (end.stopped === 'error') console.log(`  ${mag('▸')} ${yel('stopped at the first failed --do')} ${dim('— fix the batch, then run it again (finished rows are skipped), or add --keepgoing')}`);
       process.exit(end.ok && !end.failed ? 0 : 1);

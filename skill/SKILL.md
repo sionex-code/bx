@@ -156,7 +156,7 @@ seconds per item:
 
 ```bash
 # get the list on screen first (a filter, a search), then:
-bx each --if "an unread conversation" \
+bx each --without "Admin (You):" \
   --check "we have not replied yet in the open conversation" \
   --do '[{"a":"type","target":"text=Write a message…","text":"Hi {{first}}, thanks for reaching out! Please follow our page for new openings.","speed":"instant"},
          {"a":"click","target":"text=Send"}]' --dry
@@ -168,8 +168,14 @@ skip  Vijay Dhangar                               check said no (96%)  5.3s
 
 It reads the page's list, then for each row:
 
-1. **`--if "<criterion>"`** judges the row from its own text, all rows at once
-   like `sift`. Rows that fail are passed over without opening them.
+1. **`--with TEXT` / `--without TEXT`** keep or drop rows by exact text in
+   the row, and **`--if "<criterion>"`** judges the row's text with jev, all
+   rows at once like `sift`. Rows that fail are passed over without being
+   opened. **When the rule is literal text, use `--with`/`--without`, not
+   `--if`.** Asked "is the newest message from them, not Admin (You)" on a
+   real LinkedIn inbox, jev got 5 of 20 rows wrong and changed its mind
+   between runs. `--without "Admin (You):"` got all 20 right. Keep `--if`
+   for judgement ("a job applicant, not a sales pitch").
 2. It **opens the row**, by clicking it in place.
 3. **`--check "<question>"`** is asked about the opened row, with the list
    itself hidden from jev so other rows cannot answer for it. A `no` or an
@@ -181,6 +187,8 @@ It reads the page's list, then for each row:
 The list is re-read before every row, because apps re-sort it as you act,
 and rows are tracked by their link, so none is done twice or skipped.
 
+- With only `--with`/`--without`/`--if`, nothing is opened: it lists the
+  matching rows in about a second. That is the safe first look.
 - **Run it with `--dry` first** when `--do` sends, posts or deletes. `--dry`
   opens and checks every row but does not run `--do`. Opening can still mark
   a message as read.
