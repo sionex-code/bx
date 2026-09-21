@@ -14,7 +14,7 @@ const path = require('path');
 const HOME = process.env.BX_HOME || path.join(os.homedir(), '.bx');
 const DIR = path.join(HOME, 'memory');
 
-const CAP = { notes: 40, traces: 14, traps: 24, sel: 240, recipes: 60, steps: 40 };
+const CAP = { notes: 40, traces: 14, traps: 24, sel: 240, recipes: 60, steps: 40, tail: 40 };
 
 // Actions that move the tab: their result names the host everything after them
 // belongs to.
@@ -65,7 +65,7 @@ const cache = new Map();
 const dirty = new Set();
 let flushTimer = null;
 
-const blank = (host) => ({ host, first: Date.now(), updated: Date.now(), runs: 0, sel: {}, fixes: {}, traps: [], notes: [], recipes: {}, traces: [], urls: {} });
+const blank = (host) => ({ host, first: Date.now(), updated: Date.now(), runs: 0, sel: {}, fixes: {}, traps: [], notes: [], recipes: {}, traces: [], urls: {}, tail: [] });
 
 function load(host, create) {
   if (!host) return null;
@@ -75,7 +75,7 @@ function load(host, create) {
   if (!m && !create) return null;
   m = Object.assign(blank(host), m || {});
   for (const k of ['sel', 'fixes', 'recipes', 'urls']) if (!m[k] || typeof m[k] !== 'object') m[k] = {};
-  for (const k of ['traps', 'notes', 'traces']) if (!Array.isArray(m[k])) m[k] = [];
+  for (const k of ['traps', 'notes', 'traces', 'tail']) if (!Array.isArray(m[k])) m[k] = [];
   cache.set(host, m);
   return m;
 }
@@ -200,7 +200,7 @@ function redact(a, vars) {
 
 // One line per step, for a human or an agent skimming a flow.
 function brief(a) {
-  const t = selOf(a.target);
+  const t = a.target && typeof a.target === 'object' && a.target.has ? `"${a.target.has}"` : selOf(a.target);
   switch (a.a) {
     case 'nav': case 'newtab': { let s = a.url || ''; try { const u = new URL(s); s = u.host.replace(/^www\./, '') + (u.pathname === '/' ? '' : u.pathname); } catch {} return `${a.a} ${s}`; }
     case 'fill': return `fill ${Object.keys(a.fields || {}).length} fields`;
@@ -214,6 +214,39 @@ function brief(a) {
   }
 }
 const sigOf = (steps) => steps.map(brief).join(' → ');
+
+// A stored step must name its element in a way that survives the page.
+// `ref=e120` means one node in one render; replayed tomorrow it matches
+// nothing, or — worse — whatever got that number this time. The result of
+// every element action carries the durable selector it actually hit, so the
+// step is stored with that instead.
+function lasting(a, r) {
+  const t = selOf(a.target);
+  if (!t.startsWith('ref=')) return a;
+  const sel = r && r.ok && r.r && typeof r.r.sel === 'string' ? r.r.sel : null;
+  return sel ? { ...a, target: sel } : null;
+}
+
+// `bx click` waits for the page to settle after every click. That wait is
+// plumbing, not part of the flow — stored, it replays as a no-op, and it made
+// every single click look like a two-step flow worth promoting.
+const idle = (a) => a.a === 'wait' && !(a.for || a.gone || a.text || a.ms || a.load);
+
+// The holes a list of stored steps leaves, as {name, target}, with one name
+// per field. Steps from separate batches were redacted separately, so two
+// fields can arrive under the same name; they get told apart here.
+function holesOf(steps) {
+  const vars = scope();
+  const out = steps.map((st) => {
+    const o = { ...st };
+    const rename = (v, target) => (isHole(v) ? HOLE(vars.of(target || holeName(v))) : v);
+    if (o.text !== undefined) o.text = rename(o.text, selOf(o.target));
+    if (o.value !== undefined && o.a === 'setval') o.value = rename(o.value, selOf(o.target));
+    if (o.fields) { o.fields = { ...o.fields }; for (const k of Object.keys(o.fields)) o.fields[k] = rename(o.fields[k], k); }
+    return o;
+  });
+  return { steps: out, vars: vars.list };
+}
 
 // ── learning ─────────────────────────────────────────────────────────────
 function bump(m, target, action, ok, err) {
@@ -304,6 +337,7 @@ function learn(batch) {
   }
   if (!segs.length) return null;
 
+  let saved = null;
   for (const seg of segs) {
     const m = load(seg.host, true);
     if (!m) continue;
@@ -340,10 +374,23 @@ function learn(batch) {
       else if (!r.ok && r.error) trap(m, `${a.a} ${literal}: ${String(r.error).slice(0, 100)}`);
     }
 
+    // Every step that worked, whichever command it came in. Agents drive a
+    // flow one command at a time far more often than in one batch, and then
+    // no single batch is the flow — `bx learn` used to promote whatever the
+    // last two-step batch happened to be. `bx learn --last N` takes it from here.
+    for (const x of seg.items) {
+      if (batch.internal || !x.r.ok || !KEEP.has(x.a.a) || x.a.a === 'sleep' || idle(x.a)) continue;
+      const a = lasting(x.a, x.r);
+      if (!a) continue;
+      m.tail.push({ at: Date.now(), step: redact(a, scope()), name: x.r.r && x.r.r.name ? String(x.r.r.name).slice(0, 60) : undefined });
+    }
+    if (m.tail.length > CAP.tail) m.tail.splice(0, m.tail.length - CAP.tail);
+    if (!batch.internal && !saved) saved = repeated(m);
+
     // The flow itself, when the whole segment worked and it did something.
     const allOk = seg.items.every((x) => x.r.ok);
     const worth = seg.items.some((x) => WORTH.has(x.a.a));
-    const kept = seg.items.filter((x) => KEEP.has(x.a.a)).map((x) => x.a);
+    const kept = seg.items.filter((x) => KEEP.has(x.a.a) && !idle(x.a)).map((x) => lasting(x.a, x.r)).filter(Boolean);
     if (allOk && worth && kept.length >= 2) {
       const vars = scope();
       const steps = kept.slice(0, CAP.steps).map((a) => redact(a, vars));
@@ -362,8 +409,92 @@ function learn(batch) {
 
   // The host the batch spent the most actions on is the one worth reporting.
   const main = segs.slice().sort((a, b) => b.items.length - a.items.length)[0];
-  return { host: main.host, hosts: segs.map((s) => s.host), navigated };
+  return { host: main.host, hosts: segs.map((s) => s.host), navigated, saved };
 }
+
+// ── flows repeated page after page ───────────────────────────────────────
+// Posting in six LinkedIn groups was the same dozen steps six times over,
+// each a model turn, and the agent never saved the flow even when asked to.
+// So bx notices by itself: when what was done after opening one page matches
+// what was done after opening the previous page of the same kind
+// (/groups/123/ and /groups/456/), the steps both runs share become a recipe
+// and the next page is one command. Steps only one run had — a toast
+// dismissed once, a request withdrawn — are left out.
+const PAGEVERB = new Set(['nav', 'newtab']);
+const shapeOf = (u) => String(pathOf(u) || '').replace(/\/\d+(?=\/|$)/g, '/:id').replace(/\/[\w-]{16,}(?=\/|$)/g, '/:id');
+const textOf = (t) => { const x = selOf(t); return x.startsWith('text=') ? x.slice(5) : null; };
+const words = (s) => String(s).split(/\s+/);
+
+// Two steps are the same step when they do the same thing to the same
+// control — or to the page's own copy of it: "Join US Stock Market…" and
+// "Join Investment Hub…" are both the page's Join button.
+function sameStep(a, b) {
+  if (a.step.a !== b.step.a) return null;
+  const ta = selOf(a.step.target), tb = selOf(b.step.target);
+  if (ta === tb) return a.step;
+  const xa = textOf(a.step.target) ?? a.name, xb = textOf(b.step.target) ?? b.name;
+  if (!xa || !xb) return null;
+  const wa = words(xa), wb = words(xb);
+  let k = 0;
+  while (k < wa.length && k < wb.length && wa[k].toLowerCase() === wb[k].toLowerCase()) k++;
+  if (!k || k === wa.length || k === wb.length) return null;
+  return { ...a.step, target: { sel: 'button, a, [role=button], [role=link]', has: wa.slice(0, k).join(' ') } };
+}
+
+// Longest common subsequence of the two runs, under sameStep.
+function common(x, y) {
+  const n = x.length, m = y.length;
+  const L = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) {
+    L[i][j] = sameStep(x[i], y[j]) ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  }
+  const out = [];
+  for (let i = 0, j = 0; i < n && j < m;) {
+    const st = sameStep(x[i], y[j]);
+    if (st && L[i][j] === L[i + 1][j + 1] + 1) { out.push(st); i++; j++; }
+    else if (L[i + 1][j] >= L[i][j + 1]) i++; else j++;
+  }
+  return out;
+}
+
+function repeated(m) {
+  const runs = [];
+  for (const t of m.tail) {
+    if (PAGEVERB.has(t.step.a)) runs.push({ nav: t.step, steps: [] });
+    else if (runs.length) runs[runs.length - 1].steps.push(t);
+  }
+  if (runs.length < 2) return null;
+  const cur = runs[runs.length - 1], prev = runs[runs.length - 2];
+  if (!cur.nav.url || cur.nav.url === prev.nav.url || shapeOf(cur.nav.url) !== shapeOf(prev.nav.url)) return null;
+  // A flow worth replaying writes something and then commits it.
+  const wrote = (r) => r.steps.some((t) => t.step.a === 'type' || t.step.a === 'fill' || t.step.a === 'setval');
+  if (!wrote(cur) || !wrote(prev)) return null;
+  const last = cur.steps[cur.steps.length - 1];
+  if (!last || !['click', 'press'].includes(last.step.a)) return null;
+  const shared = common(cur.steps, prev.steps);
+  if (!shared.some((st) => st.a === 'type' || st.a === 'fill' || st.a === 'setval') || shared.length < 2) return null;
+
+  const { steps, vars } = holesOf([{ a: 'nav', url: cur.nav.url }, ...shared]);
+  // One text field is the common case; call its hole what it is.
+  if (vars.length === 1) {
+    const old = HOLE(vars[0].name);
+    for (const st of steps) { if (st.text === old) st.text = HOLE('text'); if (st.value === old) st.value = HOLE('text'); }
+    vars[0].name = 'text';
+  }
+  const seg = (shapeOf(cur.nav.url).split('/').filter((x) => x && x !== ':id')[0] || 'page').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+  const name = `auto-${seg}`;
+  const sig = sigOf(steps);
+  const had = m.recipes[name];
+  // Already known — say it once. The page it opens is not part of the flow.
+  if (had && sigOf(had.steps.slice(1)) === sigOf(steps.slice(1))) return null;
+  m.recipes[name] = { steps, vars, path: pathOf(cur.nav.url), ms: 0, runs: had ? had.runs : 0, ok: had ? had.ok : 0, at: Date.now(), auto: true };
+  return { host: m.host, name, steps: steps.length, vars: vars.map((v) => v.name), flow: sig };
+}
+
+// A recipe that has failed every time it was tried. Replaying it costs a
+// timeout per step and teaches nothing; it came up first in the LinkedIn
+// run's briefing, and the agent spent ten seconds finding out.
+const broken = (r) => (r.runs || 0) >= 2 && !(r.ok > 0) ? 1 : 0;
 
 // ── recall ───────────────────────────────────────────────────────────────
 function full(host) {
@@ -380,10 +511,10 @@ function digest(host) {
   if (m.host !== host) out.for = host;
 
   const recipes = Object.entries(m.recipes || {})
-    .sort((a, b) => (b[1].at || 0) - (a[1].at || 0)).slice(0, 6)
+    .sort((a, b) => (broken(a[1]) - broken(b[1])) || (b[1].at || 0) - (a[1].at || 0)).slice(0, 6)
     .map(([name, r]) => {
       const vars = (r.vars || []).map((v) => (typeof v === 'string' ? v : v.name));
-      return { name, steps: (r.steps || []).length, ok: `${r.ok || 0}/${r.runs || 0}`, path: r.path, vars: vars.length ? vars : undefined, flow: sigOf(r.steps || []).slice(0, 200) };
+      return { name, steps: (r.steps || []).length, ok: `${r.ok || 0}/${r.runs || 0}`, broken: broken(r) || undefined, path: r.path, vars: vars.length ? vars : undefined, flow: sigOf(r.steps || []).slice(0, 200) };
     });
   if (recipes.length) out.recipes = recipes;
 
@@ -449,6 +580,10 @@ function promote(host, name, opts = {}) {
   if (Array.isArray(opts.steps) && opts.steps.length) {
     const vars = scope();
     src = { steps: opts.steps.map((a) => redact(a, vars)), vars: vars.list, ms: 0, path: opts.path };
+  } else if (opts.last) {
+    const n = Math.max(1, Math.min(Number(opts.last) || 0, m.tail.length));
+    if (!m.tail.length) return { error: `nothing done on ${m.host} yet — run the flow once, then learn it` };
+    src = { ...holesOf(m.tail.slice(-n).map((t) => t.step)), ms: 0, path: opts.path };
   } else {
     const traces = m.traces;
     if (!traces.length) return { error: `nothing learned on ${m.host} yet — run the flow once, then learn it` };
@@ -462,14 +597,22 @@ function promote(host, name, opts = {}) {
   const names = Object.keys(m.recipes);
   if (names.length > CAP.recipes) delete m.recipes[names.sort((a, b) => (m.recipes[a].at || 0) - (m.recipes[b].at || 0))[0]];
   touch(m);
-  return { host: m.host, name, steps: src.steps.length, vars: (src.vars || []).map((v) => (typeof v === 'string' ? v : v.name)), flow: sigOf(src.steps) };
+  return { host: m.host, name, steps: src.steps.length, vars: (src.vars || []).map((v) => (typeof v === 'string' ? v : v.name)), flow: sigOf(src.steps), recent: recent(m) };
+}
+
+// The last few things done on this site, oldest first, numbered from the
+// end — the numbers `bx learn <name> --last N` takes.
+function recent(m, n = 12) {
+  const t = m.tail.slice(-n);
+  return t.map((x, i) => `${t.length - i}  ${brief(x.step)}`);
 }
 
 // Fill the holes a recipe left where values used to be.
-function expand(host, name, vars = {}) {
+function expand(host, name, vars = {}, force, url) {
   const m = full(host);
   const r = m && m.recipes && m.recipes[name];
   if (!r) return { error: `no recipe "${name}" for ${host}${m ? '' : ' — nothing known about this host'}` };
+  if (broken(r) && !force) return { error: `recipe "${name}" failed all ${r.runs} of its runs — it is out of date. Do the flow by hand, then bx learn ${name} --last N to replace it (bx recipe ${name} --force to run it anyway)` };
   // Old flows stored bare selectors as their hole names; accept either, and let
   // a caller who only knows the selector pass that instead of the short name.
   const byName = new Map();
@@ -496,6 +639,12 @@ function expand(host, name, vars = {}) {
     return o;
   });
   if (missing.length) return { error: `recipe "${name}" needs values: ${[...new Set(missing)].map((k) => `"${k}=…"`).join(' ')}` };
+  // The same flow on another page: the recipe's own opening nav goes there
+  // instead, or one is put in front.
+  if (url) {
+    if (actions[0] && PAGEVERB.has(actions[0].a)) actions[0] = { ...actions[0], url };
+    else actions.unshift({ a: 'nav', url });
+  }
   return { host: m.host, name, actions };
 }
 
@@ -521,7 +670,7 @@ function forget(host, what, name) {
   if (!m) return { error: `nothing known about ${host}` };
   if (what === 'recipe') { if (!m.recipes[name]) return { error: `no recipe "${name}"` }; delete m.recipes[name]; }
   else if (what === 'notes') m.notes = [];
-  else if (what === 'traces') m.traces = [];
+  else if (what === 'traces') { m.traces = []; m.tail = []; }
   else if (what === 'traps') { m.traps = []; m.fixes = {}; }
   else if (what === 'selectors') m.sel = {};
   else return { error: `forget what? all | notes | traces | traps | selectors | recipe <name>` };

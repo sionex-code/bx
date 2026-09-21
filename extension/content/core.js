@@ -35,19 +35,49 @@ BX.notfound = (t) => BX.fail(`BX_NOTFOUND ${typeof t === 'string' ? t : JSON.str
 BX.refs = new Map();      // ref -> WeakRef(el)
 BX.refOf = new WeakMap();  // el -> ref. Without this, describing 150 elements
 BX.refN = 0;               // meant 150 linear scans of the whole ref table.
-BX.ref = (el) => {
+// What each ref pointed at, kept after the element itself is gone. Apps like
+// LinkedIn and Gmail re-render a list after every action, so the ref an agent
+// read a second ago names a node that no longer exists — while an identical
+// node with the same text sits in the same place. Without this, every such
+// click waited out the full 8s timeout and failed; the LinkedIn inbox run lost
+// a minute that way over six replies.
+BX.refMeta = new Map();   // ref -> {tag, href, name}
+BX.ref = (el, name) => {
   const known = BX.refOf.get(el);
-  if (known && BX.refs.has(known)) return known;
+  if (known && BX.refs.has(known)) {
+    if (name && !BX.refMeta.get(known)?.name) BX.refMeta.get(known).name = name;
+    return known;
+  }
   const k = 'e' + ++BX.refN;
   BX.refs.set(k, new WeakRef(el));
   BX.refOf.set(el, k);
-  if (BX.refs.size > 3000) BX.refs.delete(BX.refs.keys().next().value);
+  BX.refMeta.set(k, { tag: el.tagName, href: typeof el.href === 'string' ? el.href : undefined, name });
+  if (BX.refs.size > 3000) { const old = BX.refs.keys().next().value; BX.refs.delete(old); BX.refMeta.delete(old); }
   return k;
 };
 BX.deref = (k) => {
   const w = BX.refs.get(k);
   const el = w && w.deref();
   return el && el.isConnected ? el : null;
+};
+
+// A stale ref, re-found: the one visible element with the same tag and the
+// same text (and the same link, when it was a link). Anything less certain
+// than exactly one match is refused — acting on a guess is worse than failing.
+BX.healed = null;
+BX.heal = (k) => {
+  const m = BX.refMeta.get(k);
+  if (!m || !m.name) return null;
+  const want = norm(m.name);
+  const hits = [];
+  for (const el of BX.qsa(m.tag.toLowerCase())) {
+    if (m.href && el.href !== m.href) continue;
+    if (norm(BX.textOf(el)).slice(0, 90) !== want) continue;
+    if (!BX.visible(el)) continue;
+    hits.push(el);
+    if (hits.length > 1) return null;
+  }
+  return hits[0] || null;
 };
 
 // ── visibility ───────────────────────────────────────────────────────────
@@ -280,7 +310,16 @@ BX.candidates = (target) => {
   switch (kind) {
     case 'ref': {
       const el = BX.deref(arg);
-      return el ? [el] : [];
+      if (el) return [el];
+      if (!BX.refMeta.has(arg)) return [];   // not ours — maybe another frame's
+      const again = BX.heal(arg);
+      if (again) { BX.healed = arg; return [again]; }
+      // This frame handed out that ref and its element is gone for good.
+      // Waiting will not bring it back, so say so now instead of in 8s.
+      const m = BX.refMeta.get(arg);
+      BX.fail(`ref=${arg} is stale — the page re-rendered since you read it` +
+        (m.name ? `. It was ${m.tag.toLowerCase()} "${m.name.slice(0, 50)}": target it as text=${m.name.slice(0, 50)}` : '') +
+        ', or run bx els for fresh refs');
     }
     case 'xpath': {
       const out = [];
@@ -322,7 +361,12 @@ BX.candidates = (target) => {
 // the first in the tree — taking pool[0] off an unranked list is how an action
 // reports success against the wrong element.
 BX.matches = (target, opt = {}) => {
-  const list = BX.candidates(target);
+  let list = BX.candidates(target);
+  if (opt.in) {
+    const box = BX.candidates(opt.in).find(BX.visible) || BX.candidates(opt.in)[0];
+    if (!box) BX.notfound(opt.in);
+    list = list.filter((el) => el !== box && box.contains(el));
+  }
   const vis = list.filter(BX.visible);
   const pool = vis.length ? vis : opt.anyVisibility ? list : [];
   if (pool.length < 2) return pool;
@@ -338,6 +382,7 @@ BX.matches = (target, opt = {}) => {
 BX.pool = [];
 BX.find = (target, opt = {}) => {
   BX.deliberate = false;
+  BX.healed = null;
   const pool = BX.matches(target, opt);
   BX.pool = pool;
   return pool[0] || null;
@@ -360,6 +405,24 @@ BX.want = async (target, opt = {}) => {
     gap = Math.min(400, Math.max(gap * 1.3, cost));
     await BX.sleep(Math.min(gap, left));
   }
+};
+
+// The element that actually scrolls the page. Apps like LinkedIn keep the
+// document at window height and scroll an inner <main>, so window.scrollTo
+// and scrollingElement do nothing there — a feed run scrolled "to 1200" and
+// stayed at 0 for minutes. Take the tallest scrollable box when the document
+// itself cannot move.
+BX.scroller = () => {
+  const doc = document.scrollingElement || document.documentElement;
+  if (doc.scrollHeight > doc.clientHeight + 50) return doc;
+  let best = doc;
+  for (const el of document.querySelectorAll('main, [role=main], [role=feed], section, div')) {
+    if (el.scrollHeight > el.clientHeight + 200 && el.clientHeight > 200 && el.scrollHeight > (best === doc ? 0 : best.scrollHeight)) {
+      const oy = getComputedStyle(el).overflowY;
+      if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') best = el;
+    }
+  }
+  return best;
 };
 
 // ── geometry ─────────────────────────────────────────────────────────────
@@ -457,14 +520,14 @@ BX.region = (el) => {
   return undefined;
 };
 
-BX.describe = (el) => ({
-  ref: BX.ref(el),
+BX.describe = (el) => { const name = BX.textOf(el).slice(0, 90) || undefined; return {
+  ref: BX.ref(el, name),
   tag: el.tagName.toLowerCase(),
   type: el.getAttribute?.('type') || undefined,
   role: el.getAttribute?.('role') || undefined,
-  name: BX.textOf(el).slice(0, 90) || undefined,
+  name,
   value: 'value' in el && el.value !== undefined && el.type !== 'password' ? String(el.value).slice(0, 60) : undefined,
   box: (() => { const r = el.getBoundingClientRect(); return [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]; })(),
   vis: BX.inView(el) || undefined,
   dis: BX.actionable(el) ? undefined : true
-});
+}; };

@@ -151,6 +151,38 @@ async function toFrame(tabId, frameId, action, cfg) {
   }
 }
 
+// The last failed main-frame load per tab. A tab whose load failed shows
+// Chrome's own error page under the site's URL, and that page cannot be
+// scripted — which bx used to report as "this tab can't be scripted", an
+// error that reads as permanent. On the LinkedIn inbox run it was the site
+// refusing requests for half a minute after a burst of fetches, and the agent
+// spent a minute reloading tabs and restarting the extension over it.
+const loadErr = new Map();   // tabId -> {error, url, at}
+try {
+  chrome.webNavigation.onErrorOccurred.addListener((d) => {
+    // ERR_ABORTED is a navigation replaced by another one, not a failure.
+    if (d.frameId === 0 && !/ERR_ABORTED/.test(d.error || '')) loadErr.set(d.tabId, { error: d.error, url: d.url, at: Date.now() });
+  });
+  chrome.webNavigation.onCommitted.addListener((d) => { if (d.frameId === 0) loadErr.delete(d.tabId); });
+  chrome.tabs.onRemoved.addListener((id) => loadErr.delete(id));
+} catch {}
+
+// Is the tab's main frame Chrome's error page? Returns a readable reason, or
+// null for a page that loaded.
+async function failedLoad(tabId) {
+  let f = null;
+  try { f = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }); } catch {}
+  const rec = loadErr.get(tabId);
+  const bad = (f && (f.errorOccurred || /^chrome-error:/.test(f.url || ''))) || (rec && Date.now() - rec.at < 120000);
+  if (!bad) return null;
+  const why = rec?.error || 'Chrome error page';
+  const url = rec?.url || f?.url || '';
+  const hint = /HTTP_RESPONSE_CODE|TOO_MANY|CONNECTION_(RESET|CLOSED)|EMPTY_RESPONSE|BLOCKED/i.test(why)
+    ? 'the site refused the request — after many quick requests this is usually rate limiting: wait ~30s, then bx reload'
+    : 'bx reload to try again';
+  return `page failed to load (${why})${url ? ` at ${url.split('?')[0].slice(0, 70)}` : ''} — ${hint}`;
+}
+
 const isMiss = (e) => /BX_NOTFOUND/.test(String((e && e.message) || e));
 const isNoScript = (e) => /Could not establish|Receiving end|Frame with ID|cannot be scripted|Cannot access|chrome-error|The extensions gallery/i.test(String((e && e.message) || e));
 const noScriptError = (url) => new Error(
@@ -169,7 +201,7 @@ function probeFrames(tabId, frames, action, cfg, budget) {
     const t = setTimeout(() => finish(null), budget + 500);
     const miss = () => { if (--left <= 0) finish(null); };
     for (const fid of frames) {
-      toFrame(tabId, fid, { a: 'exists', target: action.target, timeout: budget }, cfg)
+      toFrame(tabId, fid, { a: 'exists', target: action.target, in: action.in, timeout: budget }, cfg)
         .then((r) => (r && r.exists ? finish(fid) : miss()), miss);
     }
   });
@@ -190,7 +222,21 @@ async function toContent(tabId, action, cfg) {
 
   try { return await toFrame(tabId, 0, { ...action, timeout: first }, cfg); }
   catch (e) {
-    if (isNoScript(e)) { const tab = await chrome.tabs.get(tabId).catch(() => null); throw noScriptError(tab && tab.url); }
+    if (isNoScript(e)) {
+      const failed = await failedLoad(tabId);
+      if (failed) throw new Error(failed);
+      // Mid-navigation there is briefly no document to talk to. That is a
+      // wait, not a wall: give the load a moment and ask once more.
+      let tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (tab && tab.status === 'loading' && /^https?:/.test(tab.url || '')) {
+        await waitForLoad(tabId, 6000).catch(() => {});
+        try { return await toFrame(tabId, 0, { ...action, timeout: first }, cfg); }
+        catch (e2) {
+          if (!isNoScript(e2)) { if (action.frames === false || !isMiss(e2)) throw e2; e = e2; }
+          else { const f2 = await failedLoad(tabId); if (f2) throw new Error(f2); tab = await chrome.tabs.get(tabId).catch(() => null); throw noScriptError(tab && tab.url); }
+        }
+      } else throw noScriptError(tab && tab.url);
+    }
     if (action.frames === false || !isMiss(e)) throw e;
   }
 
@@ -373,7 +419,7 @@ async function shot(tabId, a, cfg) {
 
   let bmp = await dataUrlToBitmap(dataUrl);
   if (a.target) {
-    const box = await toContent(tabId, { a: 'box', target: a.target, timeout: a.timeout }, cfg);
+    const box = await toContent(tabId, { a: 'box', target: a.target, in: a.in, timeout: a.timeout }, cfg);
     const dpr = bmp.width / (await toContent(tabId, { a: 'info' }, cfg)).size[0];
     const pad = a.pad ?? 4;
     const crop = {
@@ -399,17 +445,27 @@ const toUrl = (raw) => {
   return (LOCAL.test(url) ? 'http://' : 'https://') + url;
 };
 
+// A navigation that lands on Chrome's error page did not work, whatever the
+// tab's URL says. Report it on the nav itself, not on the next action.
+async function landed(tabId, a) {
+  if (a.wait === false) return;
+  const failed = await failedLoad(tabId);
+  if (failed) throw new Error(failed);
+}
+
 W.nav = async (tabId, a) => {
   const url = toUrl(a.url);
+  loadErr.delete(tabId);
   await chrome.tabs.update(tabId, { url });
   if (a.wait !== false) await waitForLoad(tabId, a.timeout ?? 15000);
+  await landed(tabId, a);
   const t = await chrome.tabs.get(tabId);
   return { url: t.url, title: t.title, status: t.status };
 };
 
-W.back = async (tabId, a) => { await chrome.tabs.goBack(tabId); if (a.wait !== false) await waitForLoad(tabId, 15000); const t = await chrome.tabs.get(tabId); return { url: t.url }; };
-W.forward = async (tabId, a) => { await chrome.tabs.goForward(tabId); if (a.wait !== false) await waitForLoad(tabId, 15000); const t = await chrome.tabs.get(tabId); return { url: t.url }; };
-W.reload = async (tabId, a) => { await chrome.tabs.reload(tabId, { bypassCache: !!a.hard }); if (a.wait !== false) await waitForLoad(tabId, 20000); const t = await chrome.tabs.get(tabId); return { url: t.url }; };
+W.back = async (tabId, a) => { loadErr.delete(tabId); await chrome.tabs.goBack(tabId); if (a.wait !== false) await waitForLoad(tabId, 15000); await landed(tabId, a); const t = await chrome.tabs.get(tabId); return { url: t.url }; };
+W.forward = async (tabId, a) => { loadErr.delete(tabId); await chrome.tabs.goForward(tabId); if (a.wait !== false) await waitForLoad(tabId, 15000); await landed(tabId, a); const t = await chrome.tabs.get(tabId); return { url: t.url }; };
+W.reload = async (tabId, a) => { loadErr.delete(tabId); await chrome.tabs.reload(tabId, { bypassCache: !!a.hard }); if (a.wait !== false) await waitForLoad(tabId, 20000); await landed(tabId, a); const t = await chrome.tabs.get(tabId); return { url: t.url }; };
 
 W.tabs = async () => {
   const tabs = await chrome.tabs.query({});
@@ -419,6 +475,12 @@ W.tabs = async () => {
 W.newtab = async (_t, a) => {
   const t = await chrome.tabs.create({ url: a.url ? toUrl(a.url) : undefined, active: a.active !== false });
   if (a.url && a.wait !== false) await waitForLoad(t.id, a.timeout ?? 20000);
+  if (a.url) {
+    // The tab is left open either way: a caller that opened it owns closing
+    // it, and it needs the id to do that.
+    const failed = a.wait === false ? null : await failedLoad(t.id);
+    if (failed) { const e = new Error(failed); e.tab = t.id; throw e; }
+  }
   const fresh = await chrome.tabs.get(t.id);
   return { id: t.id, url: fresh.url, title: fresh.title };
 };
@@ -468,7 +530,7 @@ W.upload = async (tabId, a, cfg) => {
   // Path B: a custom widget — intercept the chooser the click would open. The
   // click has to be trusted: a synthetic one carries no user activation, and
   // input.click() on a file input is a no-op without it.
-  const box = await toContent(tabId, { a: 'box', target: a.target, timeout: a.timeout }, cfg);
+  const box = await toContent(tabId, { a: 'box', target: a.target, in: a.in, timeout: a.timeout }, cfg);
   return withCdp(tabId, async (t) => {
     await cdp(t, 'Page.enable');
     await cdp(t, 'Page.setInterceptFileChooserDialog', { enabled: true });
@@ -525,12 +587,12 @@ async function exec(tabId, a, cfg, batch) {
   // trusted:true (per action, or globally) routes input through CDP
   const trusted = a.trusted ?? batch.trusted;
   if (trusted && (a.a === 'click' || a.a === 'dblclick')) {
-    const box = await toContent(tabId, { a: 'box', target: a.target, timeout: a.timeout }, cfg);
+    const box = await toContent(tabId, { a: 'box', target: a.target, in: a.in, timeout: a.timeout }, cfg);
     return cdpClick(tabId, box.x + box.w / 2, box.y + box.h / 2, a.button === 'right' ? 'right' : 'left', a.a === 'dblclick' ? 2 : (a.clicks || 1));
   }
   if (trusted && a.a === 'type') {
-    await toContent(tabId, { a: 'click', target: a.target, speed: a.speed }, cfg);
-    if (a.clear !== false) await toContent(tabId, { a: 'clear', target: a.target }, cfg);
+    await toContent(tabId, { a: 'click', target: a.target, in: a.in, speed: a.speed }, cfg);
+    if (a.clear !== false) await toContent(tabId, { a: 'clear', target: a.target, in: a.in }, cfg);
     const r = await cdpType(tabId, a.text);
     if (a.enter) await withCdp(tabId, async (t) => {
       await cdp(t, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
@@ -566,7 +628,7 @@ async function runBatch(m) {
       results.push({ a: a.a, ok: true, ms: Math.round(performance.now() - s), r });
     } catch (e) {
       const msg = String((e && e.message) || e).replace(/^BX_NOTFOUND /, 'not found: ');
-      results.push({ a: a.a, ok: false, ms: Math.round(performance.now() - s), error: msg });
+      results.push({ a: a.a, ok: false, ms: Math.round(performance.now() - s), error: msg, ...(e && e.tab ? { tab: e.tab } : {}) });
       if (m.stopOnError !== false) break;
     }
   }

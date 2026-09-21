@@ -117,7 +117,11 @@ async function ask(state, questions, cfg, over) {
 
   const t0 = Date.now();
   let last;
-  for (let attempt = 0; attempt <= o.retries; attempt++) {
+  // "Overloaded" (529, or 503) clears in seconds, not milliseconds: one
+  // retry 350ms later failed twice in a row on a real run. Those get three
+  // more tries at 1s, 2s and 4s; everything else keeps the short retry.
+  let extra = 0;
+  for (let attempt = 0; attempt <= o.retries + extra; attempt++) {
     try {
       const r = await post(o, payload);
       const ms = Date.now() - t0;
@@ -130,8 +134,10 @@ async function ask(state, questions, cfg, over) {
       // 4xx other than rate limiting is our own bad request — retrying it
       // just burns another second on the same mistake.
       const retryable = !e.status || e.status === 429 || e.status >= 500;
-      if (!retryable || attempt === o.retries) break;
-      await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+      const busy = e.status === 529 || e.status === 503 || /overloaded/i.test(e.message || '');
+      if (busy && extra === 0) extra = 3;
+      if (!retryable || attempt >= o.retries + extra) break;
+      await new Promise((r) => setTimeout(r, busy ? 1000 * 2 ** Math.min(attempt, 2) : 350 * (attempt + 1)));
     }
   }
   stats.fails++;

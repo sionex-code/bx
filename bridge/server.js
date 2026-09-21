@@ -227,6 +227,18 @@ async function collect(b, onPage) {
       r = look.results[1];
       if (!feed || !r?.ok || (r.r.items || []).some((x) => x.href && !seenHref.has(x.href))) break;
     }
+    // Apps fill their lists in after the page reports loaded: LinkedIn's
+    // inbox showed its conversations ~4s after `bx open` returned, and a
+    // single read in that window found no list and gave up.
+    for (let late = 0; n === 1 && late < 8 && (!r?.ok || !r.r.items?.length); late++) {
+      await new Promise((ok) => setTimeout(ok, 1000));
+      look = await runBatch({ tab, memory: false, stopOnError: false, actions: [
+        { a: 'items', target: b.target, max: cap, chars: b.chars || 400 },
+        ...(n < want ? [{ a: 'nextpage' }] : [])
+      ] });
+      look.results.unshift(null);   // keep the [wait, items, nextpage] shape
+      r = look.results[1];
+    }
     if (!r?.ok) { if (n === 1) throw new HttpError(502, `could not read a list off this page: ${r?.error || 'no result'}`); break; }
     // A site that loops back to page one, or a "next" that did nothing.
     const key = (r.r.items || []).map((x) => x.href || x.text).join('|');
@@ -295,6 +307,21 @@ async function judge(b, page) {
 const SHELL = new Set();
 const PROBE = new Map();   // host -> the first fetch attempt, still in flight
 
+// Is this text a page a person would read, or something a machine left
+// lying around — serialized state, a bundle, a wall of ids? Length alone
+// said yes to 6000 characters of LinkedIn API JSON.
+function prose(text) {
+  const t = String(text || '').trim();
+  if (t.length < 200) return false;
+  if (/^(\{|\[\s*[[{"\d])/.test(t)) return false;   // a JSON document, not a markdown link
+  // Markdown links and bare URLs are ordinary page furniture; measure the rest.
+  const sample = t.slice(0, 4000).replace(/\]\([^)]*\)/g, ']').replace(/https?:\/\/\S+/g, '');
+  if (sample.length < 150) return false;
+  const code = (sample.match(/[{}"\\;<>=]/g) || []).length;
+  const words = (sample.match(/[\p{L}]{2,}/gu) || []).join('').length;
+  return code / sample.length < 0.06 && words / sample.length > 0.45;
+}
+
 // Get one page's text without the user's tab: fetch first when the site
 // serves real HTML, else render it in a background tab. `need.shot` forces a
 // tab (a fetch has no picture). The caller must call `done()`, which closes
@@ -312,7 +339,7 @@ async function grab(url, b, need = {}) {
       if (home) {
         const f = (await runBatch({ tab: home.id, memory: false, stopOnError: false, actions: [{ a: 'fetchtext', url, max: need.max || 6000 }] })).results[0];
         const text = f?.ok && f.r.status < 400 ? f.r.text : '';
-        if (text.length >= 600) return { via: 'fetch', url: f.r.url, title: f.r.title, text, els: [], done: noop };
+        if (text.length >= 600 && prose(text)) return { via: 'fetch', url: f.r.url, title: f.r.title, text, els: [], done: noop };
         if (f?.ok && f.r.status < 400) SHELL.add(host);   // a 404 says nothing about the site
       }
     } finally { if (settle) { settle(); PROBE.delete(host); } }
@@ -331,11 +358,33 @@ async function grab(url, b, need = {}) {
       ...(need.shot ? [{ a: 'shot', maxWidth: 1024, quality: 60 }] : [])
     ] });
     const r = look.results;
-    id = r[0]?.r?.id;
+    id = r[0]?.r?.id ?? r[0]?.tab;
     if (!r[0]?.ok) throw new Error(r[0]?.error || 'could not open');
     const img = need.shot && r[4]?.r?.inline ? `data:${r[4].r.mime || 'image/jpeg'};base64,${r[4].r.inline}` : null;
     return { via: 'tab', id, url: r[0].r.url || url, title: r[2]?.r?.title, text: r[2]?.r?.text || '', els: r[3]?.r?.elements || [], img, done };
   } catch (e) { await done(); throw e; }
+}
+
+// Asked alongside every check, in the same call. A question about a page
+// that did not render — a login wall, an error, a loading shell, raw data —
+// still gets a confident answer, and it is almost always "no": the LinkedIn
+// run got "no 100%" for "has the admin replied" on eleven threads it had
+// never actually seen. So jev also says whether the page was readable at
+// all, and an unreadable page answers "unknown" instead of "no".
+const READABLE = {
+  type: 'noul',
+  instructions: 'The page text above shows this page\'s real content — not only a login or sign-up wall, an error or "not available" page, a loading placeholder, or raw code/data.',
+  criteria: { true: 'Real, readable page content is present.', false: 'It is a wall, an error, a placeholder or raw data, or nearly empty.' }
+};
+// Its own call, run alongside the real one. Put in the same call it changed
+// the other answers: measured on a test inbox, "has the admin replied" went
+// from 0.99 to 0.06 just by sharing the request with this question.
+function readable(st) {
+  return jev.ask(st, { r: READABLE }, CFG.jev).then((o) => jev.read(o.answers.r)).catch(() => null);
+}
+function unreadable(r, text, saw) {
+  if (!saw && String(text || '').trim().length < 40) return 'the page had no text';
+  return r && r.value === false && r.confidence >= 0.5 ? 'the page did not show its content (a wall, error, placeholder or raw data)' : null;
 }
 
 async function checkOne(url, list, b) {
@@ -343,7 +392,10 @@ async function checkOne(url, list, b) {
   const visual = mode === 'always' || (mode === 'auto' && VISUAL.test(list.join(' ')));
   const qs = {};
   list.forEach((q, i) => { qs[`q${i}`] = { type: 'noul', instructions: String(q) }; });
-  const answer = (o) => list.map((q, i) => { const a = jev.read(o.answers[`q${i}`]); return { question: q, answer: a.value, p: a.p, confidence: a.confidence }; });
+  const answer = (o, why) => list.map((q, i) => {
+    if (why) return { question: q, answer: null, unknown: true, p: null, confidence: 0 };
+    const a = jev.read(o.answers[`q${i}`]); return { question: q, answer: a.value, p: a.p, confidence: a.confidence };
+  });
   const weak = (o) => list.some((q, i) => jev.read(o.answers[`q${i}`]).confidence < CFG.jev.min_confidence);
   const t0 = Date.now();
   const stateOf = (g) => `URL: ${g.url}\nTITLE: ${g.title || ''}\n\nPAGE TEXT:\n${g.text}` +
@@ -351,19 +403,195 @@ async function checkOne(url, list, b) {
 
   let g = await grab(url, b, { shot: visual });
   try {
-    let o = await jev.ask(stateOf(g), qs, CFG.jev, { images: g.img ? [g.img] : undefined });
+    let [o, rd] = await Promise.all([jev.ask(stateOf(g), qs, CFG.jev, { images: g.img ? [g.img] : undefined }), readable(stateOf(g))]);
     let saw = !!g.img;
-    // Not sure from the fetched HTML: render it properly and ask again.
-    if (g.via === 'fetch' && weak(o)) {
+    // Not sure from the fetched HTML, or the HTML was not the page: render
+    // it properly and ask again.
+    if (g.via === 'fetch' && (weak(o) || unreadable(rd, g.text))) {
       g = await grab(url, { ...b, fetch: false }, { shot: mode === 'auto' });
-      o = await jev.ask(stateOf(g), qs, CFG.jev, { images: g.img ? [g.img] : undefined });
+      [o, rd] = await Promise.all([jev.ask(stateOf(g), qs, CFG.jev, { images: g.img ? [g.img] : undefined }), readable(stateOf(g))]);
       saw = !!g.img;
     } else if (g.via === 'tab' && !g.img && mode === 'auto' && weak(o)) {
       const s2 = (await runBatch({ tab: g.id, memory: false, inline: true, stopOnError: false, actions: [{ a: 'shot', maxWidth: 1024, quality: 60 }] })).results[0]?.r;
       if (s2?.inline) { o = await jev.ask(stateOf(g), qs, CFG.jev, { images: [`data:${s2.mime || 'image/jpeg'};base64,${s2.inline}`] }); saw = true; }
     }
-    return { url, title: g.title, via: g.via, saw, answers: answer(o), ms: Date.now() - t0 };
+    const why = unreadable(rd, g.text, saw);
+    return { url, title: g.title, via: g.via, saw, ...(why ? { unreadable: why } : {}), answers: answer(o, why), ms: Date.now() - t0 };
   } finally { await g.done(); }
+}
+
+// Yes/no questions about the page in the tab right now. Shared by
+// `bx check` and by `bx each`, which asks it once per item it opens.
+async function checkHere(b, list) {
+  const look = await runBatch({ tab: b.tab ?? 'active', memory: false, stopOnError: false,
+    actions: [{ a: 'wait', settle: true, timeout: 3000 }, { a: 'read', mode: 'text', max: b.max || 5000, skip: b.skip, target: b.in }, { a: 'elements', max: 40, skip: b.skip, in: b.in }] });
+  look.results.shift();
+  const page = look.results[0]?.r || {};
+  const els = look.results[1]?.r?.elements || [];
+  const st = `URL: ${look.url}\nTITLE: ${page.title || ''}\n` +
+    // In a list-and-detail app the page also shows every other row; say
+    // which one the question is about, or its neighbours answer for it.
+    (b.about ? `\nTHE QUESTION IS ABOUT THE ITEM THAT IS OPEN NOW: ${b.about}\nOther items listed on the page are not it.\n` : '') +
+    (b.in ? '\nTHE TEXT BELOW IS ONE PART OF THE PAGE ONLY (one post, card or row), not the whole page.\n' : '') +
+    `\nPAGE TEXT:\n${page.text || ''}\n\nELEMENTS:\n` +
+    els.map((e) => `  ${agent.label(e)}`).join('\n');
+  const qs = {};
+  list.forEach((q, i) => { qs[`q${i}`] = { type: 'noul', instructions: String(q) }; });
+  // A yes/no near 0.5 is the text admitting it cannot tell — "did the
+  // modal close", "is that button greyed out" are about how the page looks.
+  const [out, rd] = await Promise.all([
+    askSeeing(b, st, qs, {}, (o) => list.some((q, i) => jev.read(o.answers[`q${i}`]).confidence < CFG.jev.min_confidence), list.join(' ')),
+    readable(st)
+  ]);
+  // With a screenshot attached jev saw the page itself, so thin text
+  // alone is no reason to doubt it.
+  const why = unreadable(out.saw ? null : rd, page.text, out.saw);
+  const answers = list.map((q, i) => {
+    if (why) return { question: q, answer: null, unknown: true, p: null, confidence: 0 };
+    const a = jev.read(out.answers[`q${i}`]);
+    return { question: q, answer: a.value, p: a.p, confidence: a.confidence };
+  });
+  return { ok: true, url: look.url, title: page.title, ...(why ? { unreadable: why } : {}), answers, ms: out.ms, model: out.model, saw: out.saw };
+}
+
+// ── each: one action per list item ───────────────────────────────────────
+// Read the list, keep the rows that match --if (judged from their text, all
+// at once), open each in turn, ask --check about the opened page, and run
+// the --do batch with that row's values filled in. The list is re-read before
+// every row, because apps re-sort it as you act on it, and rows are tracked
+// by their link or leading text, so nothing is done twice or skipped.
+const firstName = (name) => {
+  const w = String(name || '').trim().split(/\s+/)[0] || '';
+  // "LOVE PREET" reads as shouting in a greeting; "Love" does not.
+  return w.length > 1 && w === w.toUpperCase() && /\p{L}/u.test(w) ? w[0] + w.slice(1).toLowerCase() : w;
+};
+const fillIn = (v, vars) => {
+  if (typeof v === 'string') return v.replace(/\{\{(\w+)\}\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
+  if (Array.isArray(v)) return v.map((x) => fillIn(x, vars));
+  if (v && typeof v === 'object') { const o = {}; for (const k of Object.keys(v)) o[k] = fillIn(v[k], vars); return o; }
+  return v;
+};
+
+async function each(b, emit) {
+  const tab = b.tab ?? 'active';
+  const max = Math.max(1, Math.min(Number(b.max) || 20, 100));
+  const t0 = Date.now();
+  const deadline = b.budget ? t0 + Number(b.budget) : Infinity;
+  const seen = new Set();          // rows already opened or passed over
+  const verdict = new Map();       // row key -> --if judgement
+  let list = b.target || null, home = null, rows = 0, did = 0, skipped = 0, failed = 0;
+  const keyOf = (x) => x.href || x.text.split(' · ')[0];
+  // Rows a previous run already finished (the CLI keeps a journal).
+  for (const k of [].concat(b.skip || [])) seen.add(String(k));
+
+  while (rows < max) {
+    if (Date.now() > deadline) return { ok: true, rows, did, skipped, failed, stopped: 'budget', ms: Date.now() - t0 };
+    let look = await runBatch({ tab, memory: false, stopOnError: false, actions: [
+      { a: 'wait', settle: true, quiet: 250, timeout: 2500 },
+      { a: 'items', target: list || undefined, max: 80, chars: 300, timeout: 2500 }
+    ] });
+    let got = look.results[1];
+    const empty = () => !got?.ok || !got.r.items?.length;
+    // Opening a row went to another page and the list is not on it: go back.
+    if (empty() && home && look.url !== home) {
+      look = await runBatch({ tab, memory: false, stopOnError: false, actions: [
+        { a: 'nav', url: home }, { a: 'wait', settle: true, quiet: 250, timeout: 2500 },
+        { a: 'items', target: list || undefined, max: 80, chars: 300, timeout: 2500 }
+      ] });
+      got = look.results[2];
+    }
+    // The container found last time was rebuilt under a different path: find
+    // the list afresh, unless the caller pinned it.
+    if (empty() && list && !b.target) {
+      look = await runBatch({ tab, memory: false, stopOnError: false, actions: [{ a: 'items', max: 80, chars: 300 }] });
+      got = look.results[0];
+      // Only if it is recognisably the same list: on a detail page the
+      // biggest list is often something else, like the messages in a thread.
+      if (!empty() && got.r.items.some((x) => seen.has(keyOf(x)))) list = got.r.list;
+      else got = null;
+    }
+    // First read: the list may still be arriving (see collect).
+    for (let late = 0; !home && late < 8 && empty(); late++) {
+      await new Promise((ok) => setTimeout(ok, 1000));
+      look = await runBatch({ tab, memory: false, stopOnError: false, actions: [{ a: 'items', target: list || undefined, max: 80, chars: 300, timeout: 1500 }] });
+      got = look.results[0];
+    }
+    if (!got?.ok || !got.r.items?.length) {
+      if (!home) throw new Error(`no list found on this page${list ? ` at ${list}` : ''} — point bx each at it: bx each "<css of the list>" …`);
+      break;
+    }
+    if (!list) list = got.r.list;
+    if (!home) home = got.r.url;
+
+    // Literal rules are applied literally. Asked "is the newest message from
+    // them, not Admin (You)" about the real LinkedIn inbox, jev got 5 of 20
+    // rows wrong and changed its mind between runs; a substring test cannot.
+    const low = (t) => String(t || '').toLowerCase();
+    const literal = (x) => [].concat(b.with || []).every((w) => low(x.text).includes(low(w))) &&
+      ![].concat(b.without || []).some((w) => low(x.text).includes(low(w)));
+    for (const x of got.r.items) {
+      if (!seen.has(keyOf(x)) && !literal(x)) { seen.add(keyOf(x)); emit({ key: keyOf(x), name: x.text.split(' · ')[0], href: x.href, keep: false, by: 'text' }); }
+    }
+    const fresh = got.r.items.filter((x) => !seen.has(keyOf(x)));
+    if (!fresh.length) break;
+    if (b.if) {
+      const todo = fresh.filter((x) => !verdict.has(keyOf(x)));
+      if (todo.length) {
+        const judged = await judge({ criterion: b.if, tab, see: b.see }, { url: got.r.url, title: got.r.title, items: todo });
+        for (const x of judged) verdict.set(keyOf(x), x);
+      }
+    }
+    // Nothing to open: the whole answer is on this one read of the list.
+    if (!b.check && !b.do) {
+      for (const x of fresh) {
+        const v = verdict.get(keyOf(x));
+        seen.add(keyOf(x));
+        if (b.if && !v?.keep) { emit({ key: keyOf(x), name: x.text.split(' · ')[0], href: x.href, keep: false, p: v?.p }); continue; }
+        if (rows >= max) break;
+        rows++; did++;
+        emit({ key: keyOf(x), n: rows, name: x.text.split(' · ')[0], href: x.href, keep: b.if ? true : undefined, p: v?.p, listed: true, ms: 0 });
+      }
+      break;
+    }
+    const next = fresh.find((x) => !b.if || verdict.get(keyOf(x))?.keep);
+    // Rows that fail --if are reported once, then left alone.
+    for (const x of fresh) {
+      const v = verdict.get(keyOf(x));
+      if (b.if && v && !v.keep && !seen.has(keyOf(x))) { seen.add(keyOf(x)); emit({ key: keyOf(x), name: x.text.split(' · ')[0], href: x.href, keep: false, p: v.p }); }
+    }
+    if (!next) break;
+    seen.add(keyOf(next));
+    rows++;
+
+    const name = next.text.split(' · ')[0];
+    const vars = { name, first: firstName(name), text: next.text, href: next.href || '', n: rows };
+    const row = { key: keyOf(next), n: rows, name, href: next.href, keep: b.if ? true : undefined, p: b.if ? verdict.get(keyOf(next))?.p : undefined };
+    const r0 = Date.now();
+
+    // Nothing to look at and nothing to do: --if alone is a dry listing.
+    if (!b.check && !b.do) { emit({ ...row, listed: true, ms: 0 }); did++; continue; }
+
+    const open = await runBatch({ tab, memory: false, stopOnError: false, actions: [
+      { a: 'openitem', list, href: next.href, head: next.href ? undefined : name, timeout: 4000 },
+      { a: 'wait', settle: true, quiet: 300, timeout: 3000 }
+    ] });
+    if (!open.results[0]?.ok) { failed++; emit({ ...row, error: `could not open it: ${open.results[0]?.error}`, ms: Date.now() - r0 }); continue; }
+
+    if (b.check) {
+      const c = await checkHere({ tab, see: b.see, about: next.text.slice(0, 200), skip: list }, [b.check]);
+      const a = c.answers[0];
+      row.check = { answer: a.answer, p: a.p, unknown: a.unknown || undefined, why: c.unreadable };
+      if (a.unknown || !a.answer) { skipped++; emit({ ...row, skip: true, ms: Date.now() - r0 }); continue; }
+    }
+    if (!b.do || b.dry) { emit({ ...row, dry: !!b.do || undefined, ms: Date.now() - r0 }); if (!b.do) did++; continue; }
+
+    const out = await runBatch({ tab, stopOnError: true, memory: false, actions: fillIn(b.do, vars) });
+    const bad = out.results.find((x) => !x.ok);
+    if (bad) { failed++; emit({ ...row, error: `${bad.a}: ${bad.error}`, ms: Date.now() - r0 }); if (b.stopOnError !== false) return { ok: false, rows, did, skipped, failed, stopped: 'error', ms: Date.now() - t0 }; continue; }
+    did++;
+    emit({ ...row, done: true, ms: Date.now() - r0 });
+  }
+  return { ok: true, rows, did, skipped, failed, stopped: rows >= max ? 'max' : 'list done', ms: Date.now() - t0 };
 }
 
 // Many pages, one pool: `fn` per URL, at most `n` at a time, results in order.
@@ -428,7 +656,7 @@ async function runBatch(b) {
   let recipe = null;
   if (b.recipe) {
     const host = b.host || (await hostNow());
-    const x = mem.expand(host, b.recipe, b.vars || {});
+    const x = mem.expand(b.url ? (mem.hostOf(b.url) || host) : host, b.recipe, b.vars || {}, b.force, b.url);
     if (x.error) throw new HttpError(404, x.error);
     actions = x.actions;
     recipe = { host: x.host, name: b.recipe };
@@ -467,7 +695,7 @@ async function runBatch(b) {
   // worked here last time.
   let memory;
   try {
-    const info = mem.learn({ actions, results: out.results, url0: out.url0, url: out.url });
+    const info = mem.learn({ actions, results: out.results, url0: out.url0, url: out.url, internal: b.memory === false });
     if (info && info.host) {
       // Arriving means either the batch navigated here, or this session was
       // last working somewhere else — an agent that walks up to a tab
@@ -476,6 +704,7 @@ async function runBatch(b) {
       lastHost = info.host;
       if (recipe) mem.ran(recipe.host, recipe.name, ok, Date.now() - t0);
       if (b.memory !== false && (arrived || !ok)) memory = mem.digest(info.host);
+      if (info.saved) out.learned = info.saved;
     }
   } catch (e) { note('err', { error: 'memory: ' + String(e.message || e) }); }
 
@@ -560,7 +789,7 @@ const server = http.createServer(async (req, res) => {
       const host = b.host || (await hostNow());
       if (!host) return send(res, 400, { ok: false, error: 'no site in view — pass a host' });
       if (!b.name) return send(res, 400, { ok: false, error: 'learn needs a name' });
-      const r = mem.promote(host, b.name, { index: b.index, steps: b.steps, note: b.note, path: b.path });
+      const r = mem.promote(host, b.name, { index: b.index, steps: b.steps, last: b.last, note: b.note, path: b.path });
       return send(res, r.error ? 404 : 200, r.error ? { ok: false, ...r } : { ok: true, ...r });
     }
 
@@ -673,23 +902,22 @@ const server = http.createServer(async (req, res) => {
       const b = await body(req);
       const list = b.questions ? (Array.isArray(b.questions) ? b.questions : [b.questions]) : [b.question];
       if (!list[0]) throw new HttpError(400, 'check needs a question');
-      const look = await runBatch({ tab: b.tab ?? 'active', memory: false, stopOnError: false,
-        actions: [{ a: 'wait', settle: true, timeout: 3000 }, { a: 'read', mode: 'text', max: b.max || 5000 }, { a: 'elements', max: 40 }] });
-      look.results.shift();
-      const page = look.results[0]?.r || {};
-      const els = look.results[1]?.r?.elements || [];
-      const st = `URL: ${look.url}\nTITLE: ${page.title || ''}\n\nPAGE TEXT:\n${page.text || ''}\n\nELEMENTS:\n` +
-        els.map((e) => `  ${agent.label(e)}`).join('\n');
-      const qs = {};
-      list.forEach((q, i) => { qs[`q${i}`] = { type: 'noul', instructions: String(q) }; });
-      // A yes/no near 0.5 is the text admitting it cannot tell — "did the
-      // modal close", "is that button greyed out" are about how the page looks.
-      const out = await askSeeing(b, st, qs, {}, (o) => list.some((q, i) => jev.read(o.answers[`q${i}`]).confidence < CFG.jev.min_confidence), list.join(' '));
-      const answers = list.map((q, i) => {
-        const a = jev.read(out.answers[`q${i}`]);
-        return { question: q, answer: a.value, p: a.p, confidence: a.confidence };
-      });
-      return send(res, 200, { ok: true, url: look.url, title: page.title, answers, ms: out.ms, model: out.model, saw: out.saw });
+      return send(res, 200, await checkHere(b, list));
+    }
+
+    // "Do this to each of them": reply to every unread message, accept every
+    // pending invite, fill the same form for each row. By hand that is five
+    // model turns an item — open, look, decide, type, send — and it is how the
+    // LinkedIn inbox run spent seven minutes on nine conversations.
+    if (route === '/each' && req.method === 'POST') {
+      const b = await body(req);
+      if (!b.if && !b.check && !b.do && !b.with && !b.without) throw new HttpError(400, 'each needs something to do: --with/--without, --if, --check and/or --do');
+      if (b.do && !Array.isArray(b.do)) throw new HttpError(400, 'each --do takes a JSON array of actions');
+      res.writeHead(200, { 'content-type': 'application/x-ndjson', 'cache-control': 'no-store' });
+      const line = (x) => { try { res.write(JSON.stringify(x) + '\n'); } catch {} };
+      try { line({ t: 'end', ...(await each(b, (x) => line({ t: 'item', ...x }))) }); }
+      catch (e) { line({ t: 'end', ok: false, error: String(e.message || e) }); }
+      return res.end();
     }
 
     // The page's repeated list, optionally across several result pages. bx

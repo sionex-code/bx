@@ -6,7 +6,7 @@ var BX = (typeof BX !== 'undefined' && BX) || {};
 const A = {};
 BX.A = A;
 
-const opt = (a) => ({ speed: a.speed, timeout: a.timeout });
+const opt = (a) => ({ speed: a.speed, timeout: a.timeout, in: a.in });
 
 // What the action actually landed on: a ref for the rest of this batch, and a
 // selector that will still mean the same thing next week. The bridge keys its
@@ -20,8 +20,10 @@ const opt = (a) => ({ speed: a.speed, timeout: a.timeout });
 const hit = (el) => {
   // The name travels with the result so memory can say what a click was on
   // ("Pakistan") rather than a ref that means nothing on the next visit.
-  const h = { ref: BX.ref(el), sel: BX.durable(el), name: BX.textOf(el).replace(/\s+/g, ' ').trim().slice(0, 40) || undefined };
+  const name = BX.textOf(el).slice(0, 90);
+  const h = { ref: BX.ref(el, name || undefined), sel: BX.durable(el), name: name.slice(0, 40) || undefined };
   if (!BX.actionable(el)) h.inert = true;
+  if (BX.healed) h.healed = BX.healed;
   const pool = BX.pool;
   if (pool && pool.length > 1 && pool[0] === el && !BX.deliberate) {
     h.n = pool.length;
@@ -158,7 +160,7 @@ A.scroll = async (a) => {
     await BX.ensureVisible(box);
     return { scrolled: 'into-view', y: Math.round(scrollY) };
   }
-  const scroller = box || document.scrollingElement || document.documentElement;
+  const scroller = box || BX.scroller();
   const maxY = scroller.scrollHeight - scroller.clientHeight;
   let dx = 0, dy = 0;
   if (a.by) { dx = a.by[0] || 0; dy = a.by[1] ?? a.by; }
@@ -168,7 +170,10 @@ A.scroll = async (a) => {
   else dy = Math.round((scroller.clientHeight || innerHeight) * 0.85);
 
   const target = BX.at(BX.mouse.x, BX.mouse.y) || scroller;
-  const steps = a.speed === 'instant' ? 1 : Math.max(1, Math.min(14, Math.ceil(Math.abs(dy) / 220)));
+  // Hidden tabs get timers once a second, so a paced scroll there took 14s
+  // and timed out. BX.prof already drops to instant for hidden tabs.
+  const instant = a.speed === 'instant' || BX.prof(a.speed) === BX.PROFILES.instant;
+  const steps = instant ? 1 : Math.max(1, Math.min(14, Math.ceil(Math.abs(dy) / 220)));
   const chunk = dy / steps;
   for (let i = 0; i < steps; i++) {
     target.dispatchEvent(new WheelEvent('wheel', {
@@ -179,7 +184,7 @@ A.scroll = async (a) => {
     scroller.scrollBy ? scroller.scrollBy(dx / steps, chunk) : (scroller.scrollTop += chunk);
     if (steps > 1) await BX.sleep(10 + Math.random() * 18);
   }
-  await BX.sleep(a.settle ?? (a.speed === 'instant' ? 0 : 60));
+  await BX.sleep(a.settle ?? (instant ? 0 : 60));
   return { y: Math.round(scroller.scrollTop), max: Math.round(maxY), atBottom: scroller.scrollTop >= maxY - 2 };
 };
 
@@ -217,6 +222,13 @@ A.read = async (a) => {
   else if (mode === 'links') {
     return { links: BX.qsa('a[href]').filter(BX.visible).slice(0, a.max || 300).map((x) => ({ text: x.innerText.replace(/\s+/g, ' ').trim().slice(0, 80), href: x.href })) };
   } else text = toMd(el);
+  // Leave one region out — `bx each` reads a detail pane without the list
+  // beside it, whose rows otherwise answer questions about the open one.
+  if (a.skip) {
+    const out = BX.qsa(a.skip)[0];
+    const t = out && (mode === 'text' ? out.innerText : toMd(out));
+    if (t && t.trim()) text = text.replace(t, '');
+  }
   const cap = a.max || 40000;
   return {
     title: document.title,
@@ -232,9 +244,11 @@ A.elements = async (a) => {
   const seen = new Set();
   const out = [];
   let scanned = 0;
+  const skip = a.skip ? BX.qsa(a.skip)[0] : null;
+  const inside = a.in ? await BX.want(a.in, { timeout: a.timeout ?? 3000 }) : null;
   for (const el of BX.qsa(sel)) {
     if (++scanned > 6000) break;   // pathological page — report what we have
-    if (seen.has(el) || !BX.visible(el)) continue;
+    if (seen.has(el) || !BX.visible(el) || (skip && skip.contains(el)) || (inside && !inside.contains(el))) continue;
     seen.add(el);
     if (a.viewport !== false && !BX.inView(el)) {
       const r = el.getBoundingClientRect();
@@ -319,12 +333,44 @@ A.items = async (a) => {
     const link = el.matches('a[href]') ? el : el.querySelector('a[href]');
     return {
       i,
+      // A ref to the item itself, so the next command can act inside it:
+      // bx click text=Comment --in ref=e40.
+      ref: BX.ref(el, flat(el).slice(0, 90)),
       text: pieces(el).slice(0, cap),
       href: link ? link.href : undefined,
       sel: BX.durable(link || el)
     };
   }).filter((x) => x.text);
   return { url: location.href, title: document.title, n: items.length, of: best.els.length, list: BX.cssPath(best.parent), items };
+};
+
+// Open one item of a list found by `items`, named by its link or by how its
+// text starts. Lists in apps re-render and re-sort after every action — the
+// conversation just replied to jumps to the top — so an index or a ref from
+// the last read points at the wrong row by now. The key does not move.
+A.openitem = async (a) => {
+  const deadline = Date.now() + (a.timeout ?? 4000);
+  for (;;) {
+    const root = a.list ? BX.qsa(a.list)[0] : null;
+    const rows = root ? [...root.children] : [];
+    for (const el of rows) {
+      if (!shown(el)) continue;
+      const link = el.matches('a[href]') ? el : el.querySelector('a[href]');
+      const ok = a.href ? link && link.href === a.href : pieces(el).startsWith(a.head || '\u0000');
+      if (!ok) continue;
+      const tgt = link || el;
+      const r = await BX.clickAt(tgt, { speed: a.speed });
+      return { ...hit(tgt), ...r };
+    }
+    // The list's container itself may have been replaced; a link is a link
+    // wherever it now sits.
+    if (a.href) {
+      const l = BX.qsa('a[href]').find((x) => x.href === a.href && BX.visible(x));
+      if (l) { const r = await BX.clickAt(l, { speed: a.speed }); return { ...hit(l), ...r }; }
+    }
+    if (Date.now() >= deadline) BX.notfound(a.href || a.head || a.list);
+    await BX.sleep(150);
+  }
 };
 
 // Where "the next page of these results" is. rel=next is the honest signal;
@@ -353,10 +399,7 @@ A.nextpage = async () => {
 // Some apps scroll an inner element rather than the document, so take
 // whichever scrollable box is tallest.
 A.scrollend = async (a = {}) => {
-  let box = document.scrollingElement || document.documentElement;
-  for (const el of document.querySelectorAll('main, [role=main], [role=feed], div')) {
-    if (el.scrollHeight > el.clientHeight + 400 && el.scrollHeight > box.scrollHeight && /(auto|scroll)/.test(getComputedStyle(el).overflowY)) box = el;
-  }
+  const box = BX.scroller();
   const before = box.scrollHeight;
   box.scrollTop = box.scrollHeight;
   if (box === document.scrollingElement) window.scrollTo(0, box.scrollHeight);
@@ -377,13 +420,17 @@ A.fetchtext = async (a) => {
   const r = await fetch(a.url, { credentials: 'include', redirect: 'follow' });
   const html = await r.text();
   const doc = new DOMParser().parseFromString(html, 'text/html');
-  doc.querySelectorAll('script, style, noscript, template, svg').forEach((x) => x.remove());
+  // A parsed document has no layout, so toMd cannot tell what is hidden.
+  // Apps park their state in hidden elements — LinkedIn serves each page as
+  // an empty shell plus <code style="display:none"> blocks of API JSON — and
+  // that JSON came back as the "page text" jev then answered from.
+  doc.querySelectorAll('script, style, noscript, template, svg, code, [hidden], [aria-hidden="true"], [style*="display:none"], [style*="display: none"], [style*="visibility:hidden"], [style*="visibility: hidden"]').forEach((x) => x.remove());
   const text = doc.body ? toMd(doc.body) : '';
   return { status: r.status, url: r.url, title: doc.title, len: text.length, text: text.slice(0, a.max || 6000) };
 };
 
 A.exists = async (a) => {
-  try { const el = await BX.want(a.target, { timeout: a.timeout ?? 0 }); return { exists: true, ...BX.describe(el), ...hit(el) }; }
+  try { const el = await BX.want(a.target, { timeout: a.timeout ?? 0, in: a.in }); return { exists: true, ...BX.describe(el), ...hit(el) }; }
   catch { return { exists: false }; }
 };
 
@@ -413,7 +460,7 @@ A.wait = async (a) => {
   let gap = 20;
   for (;;) {
     const p0 = performance.now();
-    if (a.for) { const el = BX.find(a.for); if (el) return { waited: Date.now() - t0, ...hit(el) }; }
+    if (a.for) { const el = BX.find(a.for, { in: a.in }); if (el) return { waited: Date.now() - t0, ...hit(el) }; }
     else if (a.gone) { if (!BX.find(a.gone)) return { waited: Date.now() - t0 }; }
     else if (a.text) { if ((document.body?.innerText || '').toLowerCase().includes(String(a.text).toLowerCase())) return { waited: Date.now() - t0 }; }
     else if (a.settle) {
