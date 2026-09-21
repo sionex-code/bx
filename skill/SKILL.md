@@ -1,6 +1,6 @@
 ---
 name: bx
-description: Drive a real Chrome browser — navigate, click, type, fill forms, upload files, scroll, screenshot, switch tabs, read pages. Use when a task needs a logged-in browser, a page that only renders with JS, a form submitted, a file uploaded, or a screenshot of real UI. Trigger: /bx, "use the browser", "in Chrome", "fill this form", "upload to", "screenshot the page".
+description: Drive a real Chrome browser — navigate, click, type, fill forms, upload files, scroll, screenshot, switch tabs, read pages. Its fast model jev replaces most of your own per-page reasoning — bx agent clicks through to a goal, bx sift judges a whole result list across pages in seconds, bx check answers a yes/no about one page or many pages at once, bx read <urls> pulls many pages in parallel; prefer those to opening, reading and screenshotting pages yourself one by one. Use when a task needs a logged-in browser, a JS-rendered page, a form submitted, a file uploaded, results collected from a site, or a screenshot of real UI. Trigger: /bx, "use the browser", "in Chrome", "fill this form", "upload to", "screenshot the page", "find X on <site>".
 ---
 
 # bx — browser control
@@ -15,6 +15,251 @@ bx click "text=Sign in"
 bx type "#email" you@x.com --enter
 bx shot                       # → /home/you/.bx/shots/xxx.jpg
 ```
+
+## Rule 0 — every decision you make about a page, try jev first
+
+Each of your own turns costs several seconds. A jev call costs about one. So
+before you read a page and reason about it, ask whether the thing you are
+about to decide is one of these, and if it is, hand it over:
+
+| you are about to… | run this instead | cost |
+|---|---|---|
+| click and type your way to some page or state | `bx agent "<goal>"` | ~2s per step, no turns of yours |
+| go through a list and keep the ones that fit | `bx sift "<criterion>" --pages N` | ~1–2s a page, bx turns the pages |
+| read a list's items with their links | `bx items --pages N` | no model at all |
+| work out which element is "the X" | `bx pick "the X"` | one call |
+| confirm something about the page (did it save, am I logged in) | `bx check "<question>"` | one call |
+| ask the same thing about several pages (which of these groups allow X) | `bx check "<question>" <url> <url> …` | all pages at once, ~15s for 10 |
+| get values off several pages (member count, price, contact of each) | `bx read <url> <url> … --max 1500` | all pages at once, ~7s for 4 |
+
+**Never take a screenshot to see what a click did.** `bx click` reports it:
+the new URL if the page moved, and every element that appeared (a dropdown's
+options, a dialog's buttons), each with a ref you can click next. A shot
+followed by viewing it costs 5–8s of your time per click and tells you less.
+
+**`bx info` prints the full URL.** After you set a filter once by clicking,
+that URL is the filter. Copy it and change only the query from then on.
+
+**Never `sleep`.** `bx read`, `els`, `shot`, `items`, `sift`, `pick` and
+`check` wait on their own until the page has loaded and gone quiet (up to 4s),
+and `bx open` returns once the page has loaded. `sleep 3 && bx read` just adds
+three seconds.
+
+### Which command for which task
+
+Almost every browser task is some mix of these. Match the part you are on:
+
+| the task says… | shape | do this |
+|---|---|---|
+| "log in", "go to settings and change X", "fill this form", "upload" | a path of clicks | `bx agent "<goal>"`; single commands only for a step you know exactly |
+| "find N things on <site> that are X" | a list to filter | the recipe below: URL filters → `bx sift --pages N` |
+| "…which of them has / allows / shows Y" | a yes/no per item | `bx check "<Y>" <url> …` on all of them at once |
+| "…and tell me the Z of each" | a value per item | `bx read <url> … --max 1500`, then read off Z |
+| "is the page / button / modal …" (how it looks) | visual | `bx check "<question>" --see` |
+| "do X to each of them" (join, message, post) | an action per item | `bx agent "<goal>"` per item, one at a time; irreversible clicks stop for `--yes` |
+
+If you notice you are about to run the same command for the fifth time with a
+different URL, stop. There is almost always a single command for the batch.
+
+### Collecting results from a site: the recipe
+
+"Find 10 US fintech companies rated 3.8+ on Trustpilot" and "find LinkedIn
+groups about X" are the same four moves, and none of them is reading pages:
+
+1. **Get to the filtered results with a URL.** Search pages put their
+   filters in the query string. Apply a filter by clicking once if you have
+   to, read the URL it produces (`bx info`), and from then on build the URL
+   yourself: `?query=fintech&trustscore=3.0&location=United+States`. Change
+   the search terms or filters by editing the URL, never by clicking through
+   the filter UI again. Filters with an autocomplete, like a location box,
+   are where a clicking agent burns minutes.
+2. **`bx sift "<criterion>" --pages 5`** reads the list, judges every item,
+   clicks "next" and does it again: one command, a few seconds a page. Use
+   `bx items --pages 5` when you only need the raw rows.
+3. **Check exact numbers yourself.** sift is sound on judgement calls ("a
+   fintech company", "US-based", "an actual business, not a blog") but is
+   only about 90% right on number thresholds like "rated 3.8 or higher". Each
+   row shows the numbers cleanly (`Fintech Crest · fintechcrest.org · 3.9 ·
+   4 · reviews · …`), so read them off the kept rows. Put coarse number filters
+   in the URL where the site has one (`trustscore=3.0`).
+4. **For what the list does not show, check every item in one command:**
+   `bx check "<question>" <url1> <url2> …`. Never open them one by one.
+
+A task that needs 10 results is about 3 commands of yours, not 30.
+
+**Report what the page says, under the page's own label.** If the user asks
+for a field the site does not show (Fiverr publishes review counts, not order
+counts), say it is not available and offer the nearest real field, labelled
+as what it is. Never rename a nearby number to fill the column. When a number
+in `bx items` output has no label, like `4.8 · ( · 26 · )`, check what it is
+on one item's page (`bx read <url>`) before you name the column.
+
+**Big tables: don't retype rows.** Writing out a 50-row table token by token
+is slow. For large results, have a command produce it (`bx items --pages 2
+--json` piped through `jq` or a short script into a file), then show the
+file or the top rows.
+
+Use `bx agent` for navigation hops you cannot express as a URL (add `--read`
+to get the page it lands on). Going back to `bx read` and reading every card
+yourself is the slow path, and it is exactly what jev exists to replace.
+
+Drive by hand only when you already know the exact element, when the flow
+is one action long, or when jev has handed a decision back to you.
+
+### bx agent — the whole loop
+
+`bx agent "<goal>"` reads the page, asks jev which element advances the goal,
+acts, and repeats. jev returns a probability over the refs that are actually
+on the page, so it cannot invent a selector.
+
+```bash
+bx agent 'search duckduckgo.com for "anthropic claude opus" and open the first result'
+```
+```
+ 1  type     "anthropic claude opus" → textarea "Search with DuckDuckGo"   98%   ok 266ms
+ 2  click    button "Search"                                              95%   ok 502ms
+ 3  click    a "Claude Opus \ Anthropic"                                  75%   ok 151ms
+ 4  done     goal already satisfied                                       78%
+✓ done · 4 steps · brain jev · 4.8s deciding
+```
+
+Use it for anything multi-step and ordinary: find a page, run a search, fill a
+form, get through a wizard — including the navigation legs of a bigger task.
+
+**It stops rather than guesses.** Three endings need you:
+
+| ending | what it means | what to do |
+|---|---|---|
+| `unsure` | jev's confidence fell below the floor (0.55) | it prints the page and the refs — you pick, `bx click ref=eN`, then `bx agent "<the rest>"` |
+| `needs-value` | it wants to type somewhere but the goal never said what | re-run with `--var name=value` |
+| `confirm` | the next click looks irreversible (submit, delete, send) and the goal never asked for it | decide, then re-run with `--yes` |
+| `blocked` | captcha, 2FA, paywall, hard error | tell the user; do not try to route around it |
+
+`stuck` and `max-steps` mean the loop was going nowhere — read the trace, then
+drive the last bit by hand.
+
+Flags: `--steps N` (default 12) · `--dry` decide but do not act · `--hint
+"..."` extra context · `--var pass=hunter2` supply a value to type · `--yes`
+allow irreversible clicks · `--confidence 0.7` raise the floor · `--read`
+also return the final page as markdown when the goal is reached (`--read=20000`
+for a longer cap) · `--json`.
+
+**Values are never invented.** jev only ever picks from strings you supplied —
+a quoted phrase in the goal, or a `--var`. There is no "type the whole goal"
+fallback, so a goal with nothing quoted and no `--var` stops at `needs-value`
+instead of typing your instruction into a search box.
+
+**Say the constraint in the goal.** The element list tells jev which part of
+the page each element sits in (main content, navigation, header, footer,
+sidebar, form), and it is told that site furniture rarely advances a goal
+about content. Links back to pages the run already visited, and footnote or
+table-of-contents anchors that only scroll the current page, are removed
+before jev ever sees them. Phrases like "by clicking links only" or "without
+searching" are honoured, so write them down when they matter.
+
+**It will not plan several hops ahead.** jev answers "which of these, right
+now". A task whose next move only makes sense given a route three pages out —
+a Wikipedia race, say — is the one to drive yourself, or to feed a route
+through `--hint`.
+
+### bx items and bx sift — lists
+
+```bash
+bx items                           # the page's main repeated list: text + link per item
+bx items "ul.results" --max 100    # when it picks the wrong list, point it at the right one
+bx sift "fintech companies based in the US" --pages 5
+bx sift "remote jobs paying over 80k" --all   # show the dropped ones too
+bx items --pages 3 --json                     # raw rows across pages
+```
+```
+3 of 10 kept · 1.2s
+keep 100%   9  Denmark/Pakistan IT start-ups and innovation program Public Group 1K members …
+                https://www.linkedin.com/groups/12512168/
+```
+
+`items` finds the biggest block of same-shaped siblings on the page (search
+results, cards, table rows), skips navigation, header, footer and sidebar,
+and keeps each card's pieces apart with ` · ` so numbers stay readable.
+`sift` runs `items` and has jev judge every item against your criterion, one
+call per page. `--pages N` (up to 20) follows the page's "next" link or button
+and judges each page while loading the next; entries a site repeats on a
+later page are dropped. On sites without page links, which load more as you
+scroll (Facebook, LinkedIn, X), each "page" is one scroll to the bottom and
+the new rows it brings in. That only works in the visible tab, because Chrome
+stops background tabs from loading more. It stops early when there is no
+next page or a scroll brings nothing new. Put the
+criterion the way you would say it to a person, and double-check number
+thresholds yourself (see the recipe above).
+
+### bx pick and bx check — one decision each
+
+```bash
+bx pick "the main search box"      # → ref + the durable selector, 93% confident
+bx check "am I logged in"          # → yes/no with a probability
+```
+
+`pick` is the fast way out of a selector you cannot guess: it reads the live
+element list and returns something you can act on immediately. `check` answers
+a yes/no about the page in one round trip — far cheaper than a screenshot when
+all you need is whether the save went through.
+
+### Many pages at once
+
+`bx check` and `bx read` both accept any number of URLs, or `--file` with one
+per line:
+
+```bash
+bx check "the group lets members post anonymously" https://facebook.com/groups/a/ https://facebook.com/groups/b/ ...
+bx check "the company still replies to reviews" --file urls.txt --parallel 6
+bx read https://facebook.com/groups/a/ https://facebook.com/groups/b/ --max 1500   # text of each, for values
+```
+```
+yes  100%  Investors Group Pakistan | Facebook                  tab 7.9s
+no   100%  Investment Opportunities in Pakistan for Salaried…   tab 7.2s
+8 of 10 yes · 10 pages in 15.3s · 6 at a time
+```
+
+Every page is loaded at the same time in its own background tab, which is
+closed afterwards. Your tab and the user's tabs are never touched. For each
+site, bx first tries fetching the HTML from inside a tab that is already on
+that site, so the request carries the real session. When the server sends
+real text, that answer comes back in about 2s with no tab at all (`fetch` in
+the output). Sites that build the page in JavaScript, like Facebook, send an
+empty shell, so bx remembers the site and renders pages in tabs instead
+(`tab`). `--no-fetch` skips the fetch, and `--parallel N` sets how many pages
+load at once (default 6, max 12; past about 6, Chrome itself is the limit).
+
+### jev can see the page
+
+Every jev command reads the page text first. When that is not enough to be
+sure, bx takes a screenshot and asks again with the picture attached:
+
+- `bx check` and `bx pick` retry with a screenshot when the text answer falls
+  below the confidence floor.
+- `bx agent` does the same before it would hand a step back to you as `unsure`.
+- `bx sift` stays on text, because a list is text.
+
+`--see` sends a screenshot every time, and `--no-see` never sends one. A
+screenshot adds about 2.5s to a call, still well under one of your turns, so
+`bx check "is the modal closed" --see` beats taking a `bx shot` and reading it
+yourself. Output marked 👁 means jev looked. The machine-wide default is
+`bx jev set see=auto` (the default), `see=always` or `see=off`.
+
+## jev on and off
+
+jev is on by default and needs a key once:
+
+```bash
+bx jev key sk-codiv-...      # or set CODIV_API_KEY
+bx jev                       # model, key, confidence floor, what it has cost
+bx jev off                   # agent then runs on word-matching alone
+```
+
+`bx agent --no-jev` runs the identical loop with a local word-overlap brain:
+no network, no key, and noticeably worse — it wanders and gets stuck where jev
+finishes in four steps. It is there so the difference is measurable, and so
+the agent still does something when the key is missing. `pick` and `check`
+need jev and say so plainly if it is off. `sift` does too; `items` never does.
 
 ## Rule 1 — batch everything
 
@@ -70,24 +315,39 @@ back **unasked** — a `memory` block prints when you arrive at a site and
 whenever an action fails.
 
 ```
-  ▸ memory duckduckgo.com
-    recipe  search  3 steps · 1/1 ok · /  needs q
-    works   [name="q"]
-    avoid   input[name=q] (missed ×1)
-    note    the search box is a <textarea>, not an <input>
+  ▸ memory fiverr.com
+    url     /search/gigs?ref=seller_location%3APK ("Apply")
+    works   text=Seller details · text=Apply · text=Pakistan
+    note    Seller country: ref=seller_location%3APK (ISO code); country=Pakistan does nothing.
 ```
 
-Act on it before you probe. `works` is a selector that resolved here for real;
-`avoid` already cost someone the full 8s timeout. A `recipe` is the whole flow
-in one command.
+Act on it before you probe. `url` is a filter, sort or search that a past
+click turned into a URL parameter: put it straight into `bx open` and skip
+the dropdowns. `works` is a selector that resolved here for real; `avoid`
+already cost someone the full 8s timeout. A `recipe` is the whole flow in one
+command.
+
+**Save what you solved, in one line.** bx records `url` parameters and
+working selectors by itself, so do not note those. The moment you work out
+something bx cannot see, like a trap, a hidden rule, a field the site does not
+publish, or the page that actually has the data, save it as a single line:
+
+```bash
+bx note "Orders are not public; the (N) on cards is reviews."
+bx note "Search needs login; logged out it shows 10 results and stops."
+```
+
+Notes over 160 characters are refused. Every note is printed on every future
+visit, so write the one fact, not the story. Save it when you solve it, not
+at the end of the task.
 
 ```bash
 bx memo [host]              # ask directly — everything known about a site
 bx memo --all               # every site bx has driven
 bx recipe search 'q=…'      # replay a stored flow
 bx learn <name>             # name the flow you just ran, so it is one command next time
-bx note "<what bit you>"    # anything a selector cannot express
-bx forget [what] [host]     # all | notes | traces | traps | selectors | recipe <name>
+bx note "<one line>"        # a fact a selector or URL cannot express, ≤160 chars
+bx forget <what> [host]     # all | notes | traces | traps | selectors | recipe <name>
 ```
 
 **Do this:** the moment a flow that took real work finally succeeds — a login,
@@ -263,3 +523,16 @@ Any language, same contract. Token lives in `~/.bx/config.json`.
 curl -s localhost:8787/do -H "x-bx-token: $(bx token)" \
   -d '{"actions":[{"a":"nav","url":"example.com"},{"a":"read"}]}'
 ```
+
+The agent and jev are the same one endpoint each:
+
+```bash
+curl -s localhost:8787/agent -H "x-bx-token: $(bx token)" \
+  -d '{"goal":"open the pricing page","maxSteps":6}'          # add "stream":true for NDJSON
+curl -s localhost:8787/jev/pick  -d '{"want":"the login button"}'  -H "x-bx-token: $(bx token)"
+curl -s localhost:8787/jev/check -d '{"question":"is there a cookie banner"}' -H "x-bx-token: $(bx token)"
+curl -s localhost:8787/jev/sift  -d '{"criterion":"public groups over 1k members","all":true}' -H "x-bx-token: $(bx token)"
+```
+
+`/jev/ask` is the raw passthrough: send your own `questions` (`noul`, `choice`,
+`score`) and, with `"page":true`, the current page arrives as the state.

@@ -65,7 +65,7 @@ const cache = new Map();
 const dirty = new Set();
 let flushTimer = null;
 
-const blank = (host) => ({ host, first: Date.now(), updated: Date.now(), runs: 0, sel: {}, fixes: {}, traps: [], notes: [], recipes: {}, traces: [] });
+const blank = (host) => ({ host, first: Date.now(), updated: Date.now(), runs: 0, sel: {}, fixes: {}, traps: [], notes: [], recipes: {}, traces: [], urls: {} });
 
 function load(host, create) {
   if (!host) return null;
@@ -74,7 +74,7 @@ function load(host, create) {
   try { m = JSON.parse(fs.readFileSync(fileFor(host), 'utf8')); } catch {}
   if (!m && !create) return null;
   m = Object.assign(blank(host), m || {});
-  for (const k of ['sel', 'fixes', 'recipes']) if (!m[k] || typeof m[k] !== 'object') m[k] = {};
+  for (const k of ['sel', 'fixes', 'recipes', 'urls']) if (!m[k] || typeof m[k] !== 'object') m[k] = {};
   for (const k of ['traps', 'notes', 'traces']) if (!Array.isArray(m[k])) m[k] = [];
   cache.set(host, m);
   return m;
@@ -242,12 +242,47 @@ function trap(m, text) {
 
 // Everything the bridge learns from one /do. Returns which host the batch was
 // mostly about, and whether it arrived there fresh.
+// ── what the URL says ────────────────────────────────────────────────────
+// The most reusable thing an agent finds on a site is that a filter, a sort
+// or a search is just a query parameter. Found by clicking, it costs a minute
+// of dropdowns; known, it is one `bx open`. So when a click, a select or a
+// typed search leaves the page on the same path with different parameters,
+// keep the parameters that changed and what was clicked to change them. No
+// model is asked to remember anything.
+const NOISE = /^(utm_|source$|ref_ctx|search_id|context|fbclid|gclid|_|__|session|sid$|ts$|t$|pos$|position$|layout$|seller_page)/i;
+
+function urlLesson(m, seg, batch) {
+  const act = [...seg.items].reverse().find((x) => x.r.ok && ['click', 'select', 'check', 'uncheck', 'type', 'press', 'fill'].includes(x.a.a));
+  if (!act) return;
+  let u0, u1;
+  try { u0 = new URL(batch.url0); u1 = new URL(batch.url); } catch { return; }
+  if (u0.host !== u1.host || u0.pathname !== u1.pathname) return;
+  const p0 = u0.searchParams, p1 = u1.searchParams;
+  const changed = [...p1.keys()].filter((k) => !NOISE.test(k) && p1.get(k) !== p0.get(k));
+  if (!changed.length) return;
+  const via = act.a.a === 'type' ? `typed "${String(act.a.text || '').slice(0, 30)}"`
+    : act.r.r?.name ? `"${act.r.r.name}"` : selOf(act.a.target);
+  const path = u1.pathname;
+  const box = (m.urls[path] = m.urls[path] || {});
+  for (const k of changed) box[k] = { v: p1.get(k), via, at: Date.now() };
+  // Small on purpose: the newest few parameters on the few busiest paths.
+  const keys = Object.keys(box).sort((a, b) => box[b].at - box[a].at);
+  for (const k of keys.slice(6)) delete box[k];
+  const paths = Object.keys(m.urls).sort((a, b) => Math.max(...Object.values(m.urls[b]).map((x) => x.at)) - Math.max(...Object.values(m.urls[a]).map((x) => x.at)));
+  for (const p of paths.slice(3)) delete m.urls[p];
+}
+
 function learn(batch) {
   const actions = batch.actions || [];
   const results = batch.results || [];
   if (!results.length) return null;
 
-  let cur = hostOf(batch.url0) || hostOf(batch.url);
+  // A tab that starts blank (a new tab, about:blank) has no host of its own.
+  // Falling back to where the batch ended made a first visit look like
+  // staying put, and the site's briefing never showed on the one call that
+  // needs it most. Only a batch that never navigates takes the end URL.
+  let cur = hostOf(batch.url0);
+  if (!cur && !actions.some((a) => NAV.has(a.a))) cur = hostOf(batch.url);
   let navigated = false;
   const segs = [];
   const push = (host, item) => {
@@ -273,6 +308,7 @@ function learn(batch) {
     const m = load(seg.host, true);
     if (!m) continue;
     m.runs = (m.runs || 0) + 1;
+    urlLesson(m, seg, batch);
 
     // Selector scoring, plus the correction the agent found the hard way.
     const failed = new Map();   // action -> last target that missed
@@ -356,7 +392,7 @@ function digest(host) {
   const isPath = (t) => t.includes(' > ') || t.length > 80;
   const works = Object.entries(m.sel).filter(([, s]) => s.ok > 0 && s.ok >= s.bad)
     .sort((a, b) => (isPath(a[0]) - isPath(b[0])) || b[1].ok - a[1].ok || (b[1].at || 0) - (a[1].at || 0))
-    .slice(0, 8)
+    .slice(0, 4)
     .filter(([t], i, all) => !isPath(t) || all.length <= 3)
     .map(([t, s]) => (s.bad ? `${t} (${s.ok}✓/${s.bad}✗)` : t));
   if (works.length) out.works = works;
@@ -366,26 +402,36 @@ function digest(host) {
     .map(([t, s]) => (m.fixes[t] ? `${t} → use ${m.fixes[t]}` : `${t} (missed ×${s.bad})`));
   if (avoid.length) out.avoid = avoid;
 
-  const notes = m.notes.slice(-6).map((n) => n.t.slice(0, 200));
+  // One line per path: the parameters that do things here, and what set them.
+  const urls = Object.entries(m.urls || {}).map(([path, ps]) =>
+    `${path}?` + Object.entries(ps).map(([k, x]) => `${k}=${encodeURIComponent(x.v)} (${x.via})`).join(' &'));
+  if (urls.length) out.urls = urls;
+
+  const notes = m.notes.slice(-4).map((n) => n.t.slice(0, 200));
   if (notes.length) out.notes = notes;
 
   const traps = m.traps.filter((t) => (t.n || 1) >= 2).sort((a, b) => b.n - a.n).slice(0, 4).map((t) => `${t.t} (×${t.n})`);
   if (traps.length) out.traps = traps;
 
   // Flows are the point: what actually worked here, most recent first.
-  const traces = m.traces.slice(-3).reverse().slice(0, 2)
-    .map((t) => ({ path: t.path, ms: t.ms, ran: t.n, flow: t.sig.slice(0, 240) }));
-  if (traces.length && !out.recipes) out.traces = traces;
+  const traces = m.traces.slice(-3).reverse().slice(0, 1)
+    .map((t) => ({ path: t.path, ms: t.ms, ran: t.n, flow: t.sig.slice(0, 160) }));
+  if (traces.length && !out.recipes && !out.urls) out.traces = traces;
 
   return Object.keys(out).length > 1 ? out : null;
 }
 
 // ── writes the agent asks for ────────────────────────────────────────────
+const NOTE_MAX = 160;
+
 function note(host, text) {
   const m = load(host, true);
   if (!m) return null;
-  const t = String(text).trim().slice(0, 400);
+  const t = String(text).replace(/\s+/g, ' ').trim();
   if (!t) return null;
+  // Every note is read on every arrival, by every agent, forever. A paragraph
+  // here is a tax on all future runs, so refuse it and ask for the one line.
+  if (t.length > NOTE_MAX) return { error: `note is ${t.length} chars — keep it under ${NOTE_MAX}: the one fact the next run needs` };
   const norm = t.toLowerCase();
   const i = m.notes.findIndex((n) => n.t.toLowerCase() === norm);
   if (i >= 0) m.notes.splice(i, 1);

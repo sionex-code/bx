@@ -29,4 +29,8 @@ cat <<TXT
 
   Then:  bx status
 
+  Optional, for the agent loop (on by default):
+    bx jev key sk-codiv-...       # get one at https://codiv.ai
+    bx agent "open the pricing page and screenshot it"
+
 TXT

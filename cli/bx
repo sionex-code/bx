@@ -9,6 +9,14 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
+// stdout to a pipe is asynchronous in Node, and every command ends in
+// process.exit, which drops whatever is still queued: `bx items --pages 3
+// --json | jq` lost everything past 64KB. Make the pipe blocking, so each
+// write has landed before the next line runs and exiting loses nothing.
+for (const s of [process.stdout, process.stderr]) {
+  try { if (s._handle && typeof s._handle.setBlocking === 'function') s._handle.setBlocking(true); } catch {}
+}
+
 const HOME = process.env.BX_HOME || path.join(os.homedir(), '.bx');
 const CFG_PATH = path.join(HOME, 'config.json');
 
@@ -75,6 +83,37 @@ async function api(method, route, body) {
   return r.body;
 }
 
+// An agent run is seconds of silence otherwise, and the interesting part is
+// each decision as it happens, not the transcript afterwards.
+async function stream(route, payload, online) {
+  const cfg = await ensureBridge(true);
+  const data = Buffer.from(JSON.stringify(payload));
+  return new Promise((resolve, reject) => {
+    const r = http.request({
+      host: '127.0.0.1', port: cfg.port, path: route, method: 'POST',
+      headers: { 'x-bx-token': cfg.token, 'content-type': 'application/json', 'content-length': data.length }
+    }, (res) => {
+      let buf = '';
+      const last = { v: null };
+      res.setEncoding('utf8');
+      res.on('data', (c) => {
+        buf += c;
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i); buf = buf.slice(i + 1);
+          if (!line.trim()) continue;
+          let o; try { o = JSON.parse(line); } catch { continue; }
+          if (o.t === 'end') last.v = o; else online(o);
+        }
+      });
+      res.on('end', () => resolve(last.v || { ok: false, reason: 'no result' }));
+    });
+    r.on('error', reject);
+    r.setTimeout(600000, () => r.destroy(new Error('agent timed out')));
+    r.write(data); r.end();
+  });
+}
+
 // ── arg parsing ──────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
 const flags = {};
@@ -83,7 +122,7 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a.startsWith('--')) {
     const [k, v] = a.slice(2).split('=');
-    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note'].includes(k) ? argv[++i] : true) : v;
+    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file'].includes(k) ? argv[++i] : true) : v;
   } else args.push(a);
 }
 const num = (v) => (v === undefined ? undefined : Number(v));
@@ -98,8 +137,43 @@ const common = () => ({
 });
 
 // ── rendering ────────────────────────────────────────────────────────────
+// A skill file is advice a model read once, possibly an old copy of it. The
+// output of the command it just ran is read every time. So when a call is the
+// slow way of doing something jev does in a second, say so right there.
+function nudge(out) {
+  const rs = (out.results || []).filter((r) => r.ok);
+  if (rs.some((r) => r.a === 'read' && (r.r?.len || 0) > 1500 && !r.r?.links)) {
+    return `jev: going through a list by reading it yourself is the slow path — ${bold('bx items')} returns it as items, ${bold('bx sift "<criterion>"')} keeps the matching ones in ~1s`;
+  }
+  // Opening page after page on one site is the one-by-one loop the batch
+  // commands replace. Each CLI call is its own process, so the only way to
+  // see the loop is a small trail on disk.
+  const nav = rs.find((r) => r.a === 'nav');
+  if (nav) {
+    let host = '';
+    try { host = new URL(nav.r?.url || '').host; } catch {}
+    const file = path.join(HOME, 'opens.json');
+    let trail = [];
+    try { trail = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+    const now = Date.now();
+    trail = trail.filter((x) => now - x.at < 60000).concat(host ? [{ host, at: now }] : []).slice(-10);
+    try { fs.writeFileSync(file, JSON.stringify(trail)); } catch {}
+    if (host && trail.filter((x) => x.host === host).length >= 3) {
+      return `jev: opening ${host} pages one by one — ${bold('bx check "<question>" <url> <url> …')} or ${bold('bx read <url> <url> …')} does them all at once in background tabs`;
+    }
+  }
+  if (rs.some((r) => r.a === 'shot')) {
+    return `jev: to answer a question about how the page looks, ${bold('bx check "<question>" --see')} is one ~3s call instead of reading the image yourself`;
+  }
+  if (rs.some((r) => r.a === 'elements') && (rs.find((r) => r.a === 'elements').r?.n || 0) > 25) {
+    return `jev: ${bold('bx pick "<what you want>"')} chooses among these for you, and ${bold('bx agent "<goal>"')} runs the whole click-through`;
+  }
+  return null;
+}
+
 function render(out) {
-  if (flags.json) { console.log(JSON.stringify(out, null, 2)); return out.ok ? 0 : 1; }
+  const hint = nudge(out);
+  if (flags.json) { console.log(JSON.stringify(hint ? { ...out, hint: hint.replace(/\x1b\[[0-9;]*m/g, '') } : out, null, 2)); return out.ok ? 0 : 1; }
   if (out.error && !out.results) { console.error(`${BAD} ${out.error}`); return 1; }
 
   for (const r of out.results || []) {
@@ -110,6 +184,7 @@ function render(out) {
   }
   if ((out.results || []).length > 1) console.log(dim(`${DOT} ${out.results.length} actions in ${out.ms}ms  tab ${out.tab}`));
   if (out.memory) recall(out.memory);
+  if (hint) console.log(`\n  ${mag('▸')} ${dim(hint)}`);
   return out.ok ? 0 : 1;
 }
 
@@ -122,11 +197,63 @@ function recall(m, wide) {
     row('recipe', `${bold(r.name)}  ${r.steps} steps · ${r.ok} ok${r.path ? ` · ${r.path}` : ''}${r.vars ? dim(`  needs ${r.vars.join(' ')}`) : ''}`, (x) => x);
     if (wide) console.log(`            ${dim(r.flow)}`);
   }
+  for (const u of m.urls || []) row('url', u, (x) => x);
   for (const t of m.traces || []) row('worked', `${t.flow}${dim(`   (${t.ms}ms${t.ran > 1 ? ` ×${t.ran}` : ''})`)}`);
   if (m.works) row('works', m.works.join(dim(' · ')), (x) => x);
   for (const a of m.avoid || []) row('avoid', a, yel);
   for (const t of m.traps || []) row('trap', t, yel);
   for (const n of m.notes || []) row('note', n, (x) => x);
+}
+
+// ── agent rendering ──────────────────────────────────────────────────────
+// One line per decision. The percentage is jev's own confidence, and it is
+// there because a 58% click and a 99% click are very different events.
+const pct = (x) => {
+  const n = Math.round((x || 0) * 100);
+  const t = `${n}%`.padStart(4);
+  return n >= 85 ? grn(t) : n >= 60 ? yel(t) : red(t);
+};
+const secs = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}s` : `${n}ms`);
+
+function stepLine(ev) {
+  const d = ev.decided || {};
+  const n = dim(String(ev.n).padStart(2));
+  if (ev.stopped === 'done')    return console.log(`${n}  ${grn('done')}     ${dim('goal already satisfied')}  ${pct(d.confidence)}`);
+  if (ev.stopped === 'blocked') return console.log(`${n}  ${red('blocked')}  ${dim('captcha / wall / hard error')}`);
+  if (ev.stopped === 'finish')  return console.log(`${n}  ${yel('finish')}   ${dim('nothing here advances the goal')}`);
+  if (ev.stopped === 'unsure')  return console.log(`${n}  ${yel('unsure')}   ${dim(`${d.verb || '?'} ${d.target || ''}`)}  ${pct(d.confidence)}`);
+  if (ev.stopped === 'stuck')   return console.log(`${n}  ${yel('stuck')}    ${dim('same move three times, nothing changed')}`);
+  if (ev.stopped === 'confirm') return console.log(`${n}  ${mag('confirm')}  ${dim(`wants to click ${trunc(ev.element || '', 44)}`)}  ${pct(d.confidence)}`);
+  if (ev.stopped === 'needs-value') return console.log(`${n}  ${mag('needs')}    ${dim(`a value for ${trunc(ev.element || '', 44)}`)}  ${pct(d.confidence)}`);
+  const what = d.verb === 'type' ? `"${trunc(d.text, 34)}" ${dim('→')} ${trunc(ev.element || '', 40)}` : trunc(ev.element || d.target || '', 56);
+  const act = ev.dry ? dim('(dry run)') : ev.acted ? (ev.acted.ok ? `${OK} ${dim(secs(ev.acted.ms))}` : `${BAD} ${red(trunc(ev.acted.error, 60))}`) : '';
+  console.log(`${n}  ${bold((d.verb || '?').padEnd(7))}  ${what.padEnd(58)} ${pct(d.confidence)} ${dim(secs(d.ms || 0).padStart(6))}  ${act}${eye(d)}`);
+}
+
+function agentEnd(out) {
+  const mark = out.reason === 'done' ? grn('✓ done') : out.reason === 'unsure' ? yel('⊘ handing back') : out.reason === 'blocked' ? red('✗ blocked') : yel(`⊘ ${out.reason}`);
+  console.log(`\n${mark}  ${dim(out.detail || '')}`);
+  const st = out.steps || [];
+  const think = st.reduce((a, x) => a + (x.decided?.ms || 0), 0);
+  console.log(dim(`${DOT} ${st.length} steps · brain ${out.brain}${think ? ` · ${secs(think)} deciding` : ''}`));
+
+  // The escalation. bx stopped because it was not sure enough, so the thing
+  // that called bx — a bigger model, or a person — gets the page as jev saw it
+  // and takes one decision, then hands control back.
+  const last = st[st.length - 1];
+  if (['unsure', 'confirm', 'needs-value'].includes(out.reason) && last && last.handoff) {
+    console.log(`\n  ${mag('▸ over to you')} ${dim(last.handoff.url)}`);
+    for (const e of (last.handoff.elements || []).slice(0, 25)) {
+      console.log(`    ${yel(e.ref.padEnd(5))} ${dim((e.tag || '').padEnd(8))} ${trunc(e.name || '', 60)}`);
+    }
+    console.log(dim(`\n    decide, then continue:  bx click ref=eN   ·   bx agent "<goal>" --yes  ·  bx agent "<the rest of the goal>"`));
+  }
+  if (out.page && out.page.text) {
+    console.log(`\n${bold(out.page.title || '')} ${dim(out.page.url || '')}\n`);
+    console.log(out.page.text);
+    if (out.page.truncated) console.log(dim('\n… truncated — bx read --max N for more'));
+  }
+  return out.ok ? 0 : 1;
 }
 
 // An ambiguous target is not an error, so it never reaches the red path — but
@@ -143,7 +270,9 @@ function summary(a, r) {
   if (a === 'elements') return dim(`${r.n} elements`);
   if (a === 'tabs') return dim(`${r.n} tabs`);
   if (a === 'fill') return `${r.filled}/${r.of} fields`;
-  if (r.url) return dim(trunc(r.url, 90));
+  // Never shorten a URL. A caller reads filters and ids out of it, and they
+  // sit at the end: Fiverr's seller-country filter was the part cut off.
+  if (r.url) return dim(r.url);
   if (r.at) return dim(`@ ${r.at[0]},${r.at[1]}${r.trusted ? mag(' trusted') : ''}${r.covered ? yel(' covered') : ''}`);
   if (r.value !== undefined) return dim(trunc(JSON.stringify(r.value), 110));
   if (r.y !== undefined && r.max !== undefined) return dim(`y=${r.y}/${r.max}${r.atBottom ? ' (bottom)' : ''}`);
@@ -159,22 +288,52 @@ function detail(a, r) {
     console.log(`  ${yel(e.ref.padEnd(5))} ${dim(e.tag.padEnd(8))} ${trunc(e.name || '', 58).padEnd(58)} ${dim(`${e.box[0]},${e.box[1]}`)}${e.dis ? red(' disabled') : ''}`);
   }
   if (a === 'tabs') for (const t of r.tabs) {
-    console.log(`  ${(t.active ? grn('▸') : ' ')} ${yel(String(t.id).padEnd(6))} ${trunc(t.title, 46).padEnd(46)} ${dim(trunc(t.url, 60))}`);
+    console.log(`  ${(t.active ? grn('▸') : ' ')} ${yel(String(t.id).padEnd(6))} ${trunc(t.title, 46).padEnd(46)} ${dim(t.url)}`);
   }
-  if (a === 'read' && r.links) for (const l of r.links) console.log(`  ${trunc(l.text, 44).padEnd(44)} ${dim(trunc(l.href, 70))}`);
+  if (a === 'read' && r.links) for (const l of r.links) console.log(`  ${trunc(l.text, 44).padEnd(44)} ${dim(l.href)}`);
   if (a === 'fill') for (const d of r.detail) if (!d.ok) console.log(`  ${BAD} ${d.sel} ${red(trunc(d.error, 80))}`);
 }
 
+// --see forces a screenshot into the jev call, --no-see forbids one; neither
+// leaves it to the bridge (by default: only when the text answer is shaky).
+const see = () => (flags['no-see'] ? false : flags.see ? true : undefined);
+const eye = (r) => (r && r.saw ? mag(' 👁') : '');
+
 const run = async (actions) => process.exit(render(await api('POST', '/do', { ...common(), actions })));
+
+// Reads wait for the page to finish loading and go quiet first. Without this
+// a caller that just clicked has to guess, and every model guesses the same
+// way: `sleep 3 && bx read`, three seconds a step whether they were needed or
+// not. --no-wait skips it.
+const settled = async (actions) => {
+  if (flags['no-wait']) return run(actions);
+  const out = await api('POST', '/do', { ...common(), actions: [{ a: 'wait', settle: true, timeout: 4000 }, ...actions] });
+  if (out.results && out.results[0]?.a === 'wait') out.results.shift();
+  process.exit(render(out));
+};
 
 // ── commands ─────────────────────────────────────────────────────────────
 const HELP = `
 ${bold('bx')} ${dim('— drive Chrome from anything')}
 
+${bold('agent')}  ${dim('jev decides the next move from the live page — on by default')}
+  agent <goal>                run it to completion  ${dim('--steps N --dry --hint "..." --var k=v')}
+                              ${dim('--yes     allow irreversible clicks (submit, delete, send)')}
+                              ${dim('--no-jev  same loop, word-matching instead of a model')}
+                              ${dim('--read    when done, also print what the final page says')}
+                              ${dim('--see     show jev a screenshot every step  (--no-see: never)')}
+  pick <description>          which element is "the search box"  ${dim('→ ref + selector')}
+  check <question>            yes/no about this page, with a probability  ${dim('--see')}
+  check <question> <url>...   same question on many pages at once, in background tabs  ${dim('--parallel N --file F')}
+  sift <criterion>            judge every item in the page's list at once  ${dim('--pages N --all --max N --target SEL')}
+  items [target]              the page's repeated list (results, cards, rows) as items, no model  ${dim('--pages N')}
+  jev [key|on|off|model|set|ask]
+
 ${bold('page')}
   open <url>                  navigate current tab
   back | forward | reload
   read [target]               page text as markdown   ${dim('--mode text|html|md|links --max N')}
+  read <url> <url>...         many pages' text at once, in background tabs  ${dim('--max N --parallel N --file F')}
   els [css]                   interactive elements with refs
   shot [target]               screenshot              ${dim('--full --inline --maxWidth N')}
   info
@@ -260,6 +419,7 @@ async function main() {
       console.log(`  bridge     ${grn('up')}  ${dim('127.0.0.1:' + s.port + '  pid ' + s.pid)}`);
       console.log(`  extension  ${s.connected ? grn('connected') : red('not connected')}  ${dim(s.extension.id || '')}`);
       console.log(`  input      ${s.trusted ? mag('CDP trusted') : 'synthetic'} ${dim('·')} speed ${bold(s.speed)} ${dim('·')} timeout ${s.timeout}ms`);
+      console.log(`  brain      ${s.jev?.enabled ? (s.jev.ready ? grn('jev ' + s.jev.model) : yel('jev on, no key — bx jev key sk-codiv-…')) : dim('jev off')}`);
       console.log(`  config     ${dim(CFG_PATH)}`);
       if (!s.connected) console.log(`\n  ${yel('→')} load ${bold(path.join(ROOT, 'extension'))} at ${blu('chrome://extensions')} (Developer mode → Load unpacked)`);
       return;
@@ -334,10 +494,141 @@ async function main() {
     }
 
     case 'forget': {
-      const what = args[0] || 'all';
+      // No default. A bare `bx forget` used to mean "all" and silently wiped
+      // everything learned about the current site.
+      const what = args[0];
+      if (!what) die(`forget what? ${bold('bx forget all|notes|traces|traps|selectors|recipe <name>')}  ${dim('--host H, default: this tab')}`);
       const r = await api('POST', '/memory/forget', { what, name: args[1], host: flags.host || (what === 'all' ? args[1] : undefined) });
       if (!r.ok) die(r.error);
       console.log(`${OK} forgot ${bold(r.name || r.forgot)}${r.host ? dim(` on ${r.host}`) : ''}`);
+      return;
+    }
+
+    // ── jev ──────────────────────────────────────────────────────────────
+    case 'agent': {
+      const goal = args.join(' ');
+      if (!goal) die(`agent needs a goal — ${bold('bx agent "find the pricing page and screenshot it"')}`);
+      const vars = {};
+      for (let i = 0; i < argv.length; i++) {
+        if (argv[i] === '--var' && argv[i + 1]) { const [k, ...r] = argv[++i].split('='); vars[k] = r.join('='); }
+      }
+      const useJev = !(flags['no-jev'] || flags.nojev || flags.brain === 'local' || flags.brain === 'off');
+      const payload = {
+        ...common(), goal, hint: flags.hint, vars, jev: useJev,
+        maxSteps: num(flags.steps), dry: !!flags.dry, min_confidence: num(flags.confidence), allow: !!flags.yes, see: see(),
+        read: flags.read ? (num(flags.read) || true) : undefined
+      };
+      if (flags.json) { const out = await api('POST', '/agent', payload); console.log(JSON.stringify(out, null, 2)); process.exit(out.ok ? 0 : 1); }
+      console.log(`${mag('▸ agent')} ${bold(trunc(goal, 70))}  ${dim(useJev ? 'brain jev' : 'brain local (no jev)')}`);
+      const steps = [];
+      const out = await stream('/agent', { ...payload, stream: true }, (ev) => { steps.push(ev); stepLine(ev); });
+      process.exit(agentEnd({ ...out, steps }));
+    }
+
+    case 'pick': {
+      const want = args.join(' ');
+      if (!want) die(`pick needs a description — ${bold('bx pick "the search box"')}`);
+      const r = await api('POST', '/jev/pick', { want, tab: common().tab, max: num(flags.max), see: see() });
+      if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
+      if (!r.ok) die(r.error || 'no match');
+      console.log(`${OK} ${yel(r.ref.padEnd(5))} ${trunc(r.label, 60)}  ${pct(r.confidence)} ${dim(secs(r.ms))}${eye(r)}`);
+      if (r.sel) console.log(`  ${dim('selector')} ${blu(r.sel)}`);
+      for (const a of r.alternatives || []) console.log(`  ${dim('also')} ${yel(a.label.padEnd(5))} ${dim(`${Math.round(a.p * 100)}%`)}`);
+      return;
+    }
+
+    case 'check': {
+      // URLs anywhere in the arguments (or one per line in --file) turn this
+      // into the parallel form: every page checked at once, none of them in
+      // the user's tab.
+      const urls = args.filter((x) => /^https?:\/\//i.test(x));
+      if (flags.file) urls.push(...fs.readFileSync(flags.file, 'utf8').split(/\s+/).filter((x) => /^https?:\/\//i.test(x)));
+      if (urls.length) {
+        const q = args.filter((x) => !/^https?:\/\//i.test(x)).join(' ');
+        if (!q) die(`check needs a question — ${bold('bx check "has an Anonymous post option" <url> <url> ...')}`);
+        const r = await api('POST', '/jev/many', { question: q, urls, parallel: num(flags.parallel), see: see(), fetch: flags['no-fetch'] ? false : undefined });
+        if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
+        if (!r.ok) die(r.error || 'check failed');
+        let yes = 0;
+        for (const x of r.results) {
+          if (x.error) { console.log(`${red('err')}  ${trunc(x.url, 70)}  ${dim(trunc(x.error, 60))}`); continue; }
+          const a = x.answers[0];
+          if (a.answer) yes++;
+          console.log(`${a.answer ? grn('yes') : red('no ')}  ${pct(a.answer ? a.p : 1 - (a.p ?? 0))}  ${trunc(x.title || x.url, 58).padEnd(58)} ${dim(`${x.via} ${secs(x.ms)}`)}${eye(x)}\n     ${dim(x.url)}`);
+        }
+        console.log(dim(`${yes} of ${r.n} yes · ${r.n} pages in ${secs(r.ms)} · ${r.parallel} at a time`));
+        return;
+      }
+      const q = args.join(' ');
+      if (!q) die(`check needs a question — ${bold('bx check "am I logged in"')}`);
+      const r = await api('POST', '/jev/check', { question: q, tab: common().tab, see: see() });
+      if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
+      if (!r.ok) die(r.error || 'check failed');
+      for (const a of r.answers) {
+        console.log(`${a.answer ? grn('yes') : red('no ')}  ${trunc(a.question, 60).padEnd(60)} ${pct(a.p === undefined ? a.confidence : (a.answer ? a.p : 1 - a.p))} ${dim(secs(r.ms))}${eye(r)}`);
+      }
+      process.exit(r.answers.every((a) => a.answer) ? 0 : 1);
+    }
+
+    case 'items': {
+      const r = await api('POST', '/items', { ...common(), target: args[0] || flags.target, max: num(flags.max) || 60, chars: num(flags.chars), pages: num(flags.pages) });
+      if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
+      if (!r.ok) die(r.error || 'items failed');
+      if (!r.n) die('no repeated list found — narrow it: bx items "<css of the list>"');
+      console.log(dim(`${r.n} items${r.pages > 1 ? ` across ${r.pages} pages` : ''}`));
+      for (const p of r.results) {
+        if (r.pages > 1) console.log(dim(`── page ${p.page}  ${p.url}`));
+        for (const it of p.items) console.log(`${yel(String(it.i).padStart(3))}  ${trunc(it.text, 160)}${it.href ? `\n     ${dim(it.href)}` : ''}`);
+      }
+      return;
+    }
+
+    case 'sift': {
+      const criterion = args.join(' ');
+      if (!criterion) die(`sift needs a criterion — ${bold('bx sift "groups about home cooking with over 10k members"')}`);
+      const r = await api('POST', '/jev/sift', { criterion, tab: common().tab, max: num(flags.max), target: flags.target, pages: num(flags.pages), all: !!flags.all, chars: num(flags.chars), see: see() });
+      if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
+      if (!r.ok) die(r.error || 'sift failed');
+      console.log(dim(`${r.kept} of ${r.n} kept${r.pages > 1 ? ` across ${r.pages} pages` : ''} · ${secs(r.ms)}`) + eye(r));
+      for (const it of r.items) {
+        const mark = it.keep ? grn('keep') : dim('drop');
+        console.log(`${mark} ${pct(it.keep ? it.p : 1 - (it.p ?? 0))}  ${yel(`${r.pages > 1 ? `p${it.page}·` : ''}${it.i}`.padStart(2))}  ${trunc(it.text, 130)}${it.href ? `\n                ${dim(it.href)}` : ''}`);
+      }
+      process.exit(r.kept ? 0 : 1);
+    }
+
+    case 'jev': {
+      const sub = args.shift();
+      if (sub === 'key') {
+        const k = args[0] || flags.key;
+        if (!k) die('bx jev key sk-codiv-...');
+        const r = await api('POST', '/jev', { api_key: k, enabled: true });
+        console.log(`${OK} key stored in ${dim(CFG_PATH)} ${dim('(0600)')}`);
+        return;
+      }
+      if (sub === 'on' || sub === 'off') { await api('POST', '/jev', { enabled: sub === 'on' }); console.log(`${OK} jev ${sub}`); return; }
+      if (sub === 'model') { const r = await api('POST', '/jev', { model: args[0] }); console.log(`${OK} model ${bold(r.jev.model)}`); return; }
+      if (sub === 'set') {
+        const patch = {};
+        for (const a of args) { const [k, v] = a.split('='); patch[k] = /^[\d.]+$/.test(v) ? Number(v) : v === 'true' ? true : v === 'false' ? false : v; }
+        const r = await api('POST', '/jev', patch);
+        console.log(JSON.stringify(r.jev, null, 2));
+        return;
+      }
+      if (sub === 'ask') {
+        let questions;
+        try { questions = JSON.parse(args.join(' ')); } catch { die(`bx jev ask '{"urgent":{"type":"noul","instructions":"..."}}'`); }
+        const r = await api('POST', '/jev/ask', { questions, page: true, tab: common().tab, state: flags.state });
+        console.log(JSON.stringify(r, null, 2));
+        return;
+      }
+      const r = await api('GET', '/jev');
+      if (flags.json) { console.log(JSON.stringify(r, null, 2)); return; }
+      console.log(`${r.ready ? OK : BAD} jev ${r.enabled ? grn('on') : yel('off')}${r.ready ? '' : red('  no key — bx jev key sk-codiv-…')}`);
+      console.log(`  ${dim('model')}      ${bold(r.model)}   ${dim(r.base)}`);
+      if (r.key) console.log(`  ${dim('key')}        ${r.key} ${dim(`(${r.source})`)}`);
+      console.log(`  ${dim('floor')}      ${r.min_confidence} ${dim('— below this the agent stops and hands back')}`);
+      console.log(`  ${dim('used')}       ${r.usage.calls} calls${r.usage.failed ? red(`, ${r.usage.failed} failed`) : ''}${r.usage.calls ? dim(`, ${r.usage.avg_ms}ms avg, ${r.usage.input_tokens} input tokens`) : ''}`);
       return;
     }
 
@@ -347,8 +638,34 @@ async function main() {
     case 'reload': return run([{ a: 'reload', hard: !!flags.hard }]);
     case 'info': return run([{ a: 'info' }]);
 
-    case 'click': case 'dblclick': case 'rclick': case 'hover':
-      return run([{ a: cmd, target: target(), button: flags.button, clicks: num(flags.clicks) }]);
+    case 'click': case 'dblclick': case 'rclick': case 'hover': {
+      const act = { a: cmd, target: target(), button: flags.button, clicks: num(flags.clicks) };
+      if (flags.json || flags['no-wait']) return run([act]);
+      // Say what the click did — where the page went, what opened — so the
+      // next move is not "take a screenshot to see what happened". That
+      // reflex cost the Fiverr run more than a minute: a shot, then the
+      // model viewing the image, after nearly every click.
+      const out = await api('POST', '/do', { ...common(), stopOnError: false, actions: [
+        { a: 'info' }, { a: 'elements', max: 300 }, act,
+        { a: 'wait', settle: true, quiet: 250, timeout: 2500 }, { a: 'info' }, { a: 'elements', max: 300 }
+      ] });
+      const [i0, e0, did, , i1, e1] = out.results || [];
+      const before = new Set((e0?.r?.elements || []).map((e) => `${e.ref}|${e.name || ''}`));
+      const fresh = (e1?.r?.elements || []).filter((e) => !before.has(`${e.ref}|${e.name || ''}`) && e.name);
+      const gone = (e0?.r?.elements || []).length - (e1?.r?.elements || []).length + fresh.length;
+      out.results = [did];
+      const code = render(out);
+      if (did?.ok) {
+        const u0 = i0?.r?.url, u1 = i1?.r?.url;
+        if (u1 && u1 !== u0) console.log(`  ${mag('→')} ${dim('now at')} ${u1}`);
+        if (fresh.length) {
+          console.log(`  ${mag('+')} ${dim(`${fresh.length} new on screen:`)}`);
+          for (const e of fresh.slice(0, 15)) console.log(`    ${yel(e.ref.padEnd(5))} ${dim((e.tag || '').padEnd(8))} ${trunc(e.name, 70)}`);
+          if (fresh.length > 15) console.log(dim(`    … ${fresh.length - 15} more — bx els`));
+        } else if (!(u1 && u1 !== u0)) console.log(`  ${dim(gone > 0 ? `${gone} elements went away, nothing new appeared` : 'no visible change — nothing opened and the URL did not move')}`);
+      }
+      process.exit(code);
+    }
 
     case 'type': return run([{ a: 'type', target: target(), text: args.slice(1).join(' '), enter: !!flags.enter, clear: flags.noclear ? false : undefined }]);
     case 'clear': return run([{ a: 'clear', target: target() }]);
@@ -385,12 +702,28 @@ async function main() {
       return run([a]);
     }
 
-    case 'read': return run([{ a: 'read', target: target(), mode: flags.mode, max: num(flags.max) }]);
-    case 'els': case 'elements': return run([{ a: 'elements', filter: args[0] || flags.filter, max: num(flags.max) }]);
+    case 'read': {
+      const urls = args.filter((x) => /^https?:\/\//i.test(x));
+      if (flags.file) urls.push(...fs.readFileSync(flags.file, 'utf8').split(/\s+/).filter((x) => /^https?:\/\//i.test(x)));
+      if (urls.length) {
+        const r = await api('POST', '/many/read', { urls, mode: flags.mode, max: num(flags.max), parallel: num(flags.parallel), fetch: flags['no-fetch'] ? false : undefined });
+        if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
+        if (!r.ok) die(r.error || 'read failed');
+        for (const x of r.results) {
+          if (x.error) { console.log(`\n${red('═══ err')} ${x.url}  ${dim(trunc(x.error, 60))}`); continue; }
+          console.log(`\n${bold('═══')} ${bold(trunc(x.title || '', 70))}  ${dim(`${x.via} ${secs(x.ms)}`)}\n${dim(x.url)}\n`);
+          console.log(x.text);
+        }
+        console.log(dim(`\n${r.n} pages in ${secs(r.ms)} · ${r.parallel} at a time`));
+        return;
+      }
+      return settled([{ a: 'read', target: target(), mode: flags.mode, max: num(flags.max) }]);
+    }
+    case 'els': case 'elements': return settled([{ a: 'elements', filter: args[0] || flags.filter, max: num(flags.max) }]);
     case 'exists': return run([{ a: 'exists', target: target(), timeout: num(flags.timeout) ?? 0 }]);
 
     case 'shot': case 'screenshot':
-      return run([{ a: 'shot', target: target(), fullPage: !!flags.full, format: flags.format, quality: num(flags.quality), maxWidth: num(flags.maxWidth) }]);
+      return settled([{ a: 'shot', target: target(), fullPage: !!flags.full, format: flags.format, quality: num(flags.quality), maxWidth: num(flags.maxWidth) }]);
 
     case 'upload': return run([{ a: 'upload', target: target(), files: args.slice(1).map((f) => path.resolve(f)), viaDialog: !!flags.dialog }]);
     case 'eval': return run([{ a: 'eval', expr: args.join(' ') }]);
