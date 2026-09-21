@@ -122,7 +122,7 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a.startsWith('--')) {
     const [k, v] = a.slice(2).split('=');
-    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out', 'last', 'if', 'check', 'do', 'with', 'without'].includes(k) ? argv[++i] : true) : v;
+    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out', 'last', 'if', 'check', 'do', 'with', 'without', 'in'].includes(k) ? argv[++i] : true) : v;
   } else args.push(a);
 }
 const num = (v) => (v === undefined ? undefined : Number(v));
@@ -160,6 +160,19 @@ function nudge(out) {
     try { fs.writeFileSync(file, JSON.stringify(trail)); } catch {}
     if (host && trail.filter((x) => x.host === host).length >= 3) {
       return `jev: opening ${host} pages one by one — ${bold('bx check "<question>" <url> <url> …')} or ${bold('bx read <url> <url> …')} does them all at once in background tabs`;
+    }
+  }
+  // Reverse-engineering the page with eval, one probe per turn: the LinkedIn
+  // feed run spent 118 of its 138 commands on that and posted one comment.
+  if (rs.some((r) => r.a === 'eval')) {
+    const file = path.join(HOME, 'evals.json');
+    let trail = [];
+    try { trail = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+    const now = Date.now();
+    trail = trail.filter((t) => now - t < 120000).concat(now).slice(-10);
+    try { fs.writeFileSync(file, JSON.stringify(trail)); } catch {}
+    if (trail.length >= 4) {
+      return `jev: that is ${trail.length} evals in two minutes — stop digging through the DOM. ${bold('bx items --chars 2000')} gives each post/card's full text and a ref; ${bold('bx click text=Comment --in ref=eN')} and ${bold(`bx do --in ref=eN '[…]'`)} act inside that one item; ${bold('bx scroll')} finds the real scroller`;
     }
   }
   // Open, type, send, next: the per-item loop `bx each` replaces. The
@@ -333,6 +346,9 @@ function summary(a, r) {
   // sit at the end: Fiverr's seller-country filter was the part cut off.
   if (r.url) return dim(r.url);
   if (r.at) return dim(`@ ${r.at[0]},${r.at[1]}${r.trusted ? mag(' trusted') : ''}${r.covered ? yel(' covered') : ''}`);
+  // eval's value is the answer, not a status line. Cut to 110 characters, a
+  // LinkedIn run re-read one post in 150-character slices for two minutes.
+  if (a === 'eval' && r.value !== undefined) return '';
   if (r.value !== undefined) return dim(trunc(JSON.stringify(r.value), 110));
   if (r.y !== undefined && r.max !== undefined) return dim(`y=${r.y}/${r.max}${r.atBottom ? ' (bottom)' : ''}`);
   return dim(trunc(JSON.stringify(r), 110));
@@ -343,6 +359,11 @@ function detail(a, r) {
     console.log(`  ${dim('also')} ${yel(o.ref.padEnd(5))} ${trunc(o.css, 88)}${o.dis ? red(' disabled') : ''}`);
   }
   if (a === 'read' && r.text) console.log('\n' + r.text + '\n');
+  if (a === 'eval' && r && r.value !== undefined) {
+    const v = typeof r.value === 'string' ? r.value : JSON.stringify(r.value, null, 1);
+    const cap = num(flags.max) || 20000;
+    console.log(v.length > cap ? `${v.slice(0, cap)}\n${dim(`… ${v.length - cap} more characters (--max N)`)}` : v);
+  }
   if (a === 'elements') {
     for (const e of r.elements) {
       console.log(`  ${yel(e.ref.padEnd(5))} ${dim(e.tag.padEnd(8))} ${trunc(e.name || '', 58).padEnd(58)} ${dim(`${e.box[0]},${e.box[1]}`)}${e.dis ? red(' disabled') : ''}`);
@@ -361,7 +382,11 @@ function detail(a, r) {
 const see = () => (flags['no-see'] ? false : flags.see ? true : undefined);
 const eye = (r) => (r && r.saw ? mag(' 👁') : '');
 
-const run = async (actions) => process.exit(render(await api('POST', '/do', { ...common(), actions })));
+// --in <target>: every action in the command acts inside that element only —
+// one post in a feed, one row, one card. A feed has dozens of identical
+// "Comment" buttons; scoped, "text=Comment" means this post's.
+const scoped = (actions) => (flags.in && flags.in !== true ? actions.map((x) => ({ in: flags.in, ...x })) : actions);
+const run = async (actions) => process.exit(render(await api('POST', '/do', { ...common(), actions: scoped(actions) })));
 
 // Reads wait for the page to finish loading and go quiet first. Without this
 // a caller that just clicked has to guess, and every model guesses the same
@@ -441,6 +466,7 @@ ${bold('targets')}  ${dim('css  ·  text=Sign in  ·  ref=e12  ·  role=button:S
          ${dim('several matches? bx picks the enabled one, prints "N matched" and lists the rest as refs.')}
          ${dim('narrow with  --has TEXT  --near SEL  --nth N,  or click the ref it showed you.')}
 ${bold('flags')}    ${dim('--tab <id> --speed <p> --timeout <ms> --json --keepgoing')}
+         ${dim('--in <target>  act only inside that element: bx do --in ref=e40 \'[…]\', bx click text=Comment --in ref=e40')}
 `;
 
 const target = (i = 0) => {
@@ -779,7 +805,7 @@ async function main() {
       console.log(dim(`${r.n} items${r.pages > 1 ? ` across ${r.pages} pages` : ''}`));
       for (const p of r.results) {
         if (r.pages > 1) console.log(dim(`── page ${p.page}  ${p.url}`));
-        for (const it of p.items) console.log(`${yel(String(it.i).padStart(3))}  ${trunc(it.text, 160)}${it.href ? `\n     ${dim(it.href)}` : ''}`);
+        for (const it of p.items) console.log(`${yel(String(it.i).padStart(3))}${it.ref ? ` ${dim(it.ref)}` : ''}  ${flags.chars ? it.text : trunc(it.text, 160)}${it.href ? `\n     ${dim(it.href)}` : ''}`);
       }
       return;
     }
@@ -847,7 +873,7 @@ async function main() {
       // reflex cost the Fiverr run more than a minute: a shot, then the
       // model viewing the image, after nearly every click.
       const out = await api('POST', '/do', { ...common(), stopOnError: false, actions: [
-        { a: 'info' }, { a: 'elements', max: 300 }, act,
+        { a: 'info' }, { a: 'elements', max: 300 }, ...scoped([act]),
         { a: 'wait', settle: true, quiet: 250, timeout: 2500 }, { a: 'info' }, { a: 'elements', max: 300 }
       ] });
       const [i0, e0, did, , i1, e1] = out.results || [];

@@ -97,6 +97,7 @@ Almost every browser task is some mix of these. Match the part you are on:
 | "…and tell me the Z of each" | a value per item | `bx read <url> … --max 1500`, then read off Z |
 | "is the page / button / modal …" (how it looks) | visual | `bx check "<question>" --see` |
 | "do X to each of them" (reply, accept, message, fill) | an action per item | `bx each` — one command for the whole list, see below |
+| "comment on / like posts in the feed" | one item among many identical ones | `bx items --chars 2000`, then `bx do --in ref=eN '[…]'` per post |
 | "post / apply / submit on each of these pages" | the same flow on page after page | do it by hand on two pages; bx saves it; then `bx recipe <name> <url> 'text=…'` per page |
 
 If you notice you are about to run the same command for the fifth time with a
@@ -162,6 +163,26 @@ bx each --without "Admin (You):" --check "we have not replied yet in the open co
 Use `--with`/`--without` for literal text rules and `--if` only for
 judgement. Run `--dry` first when `--do` sends anything. Running the same
 command again continues where it stopped. Details: REFERENCE.md.
+
+### Acting on one item among many (commenting, liking, replying in a feed)
+
+A feed has dozens of identical "Comment", "Like" and "Post" buttons. Do not
+work out which one with `eval`: one LinkedIn run spent 118 of its 138
+commands doing that and posted a single comment. Instead:
+
+```bash
+bx items --chars 2000 --max 15          # each post's full text, each with a ref (e.g. e5)
+# read them, write one comment per post you pick, then per post:
+bx click text=Comment --in ref=e5
+bx do --in ref=e5 '[{"a":"type","target":"[contenteditable]","text":"…"},{"a":"click","target":"text=Post"}]'
+```
+
+`--in <target>` makes every action in the command act only inside that
+element, so `text=Comment` means this post's button. `bx scroll` and
+`bx items --pages N` scroll the feed's real scroller, even when the app
+scrolls an inner element and `window.scrollTo` does nothing. `bx eval`
+prints its whole result (`--max N` to cap), so there is no need to read a
+value in slices.
 
 ### The same flow on page after page
 

@@ -6,7 +6,7 @@ var BX = (typeof BX !== 'undefined' && BX) || {};
 const A = {};
 BX.A = A;
 
-const opt = (a) => ({ speed: a.speed, timeout: a.timeout });
+const opt = (a) => ({ speed: a.speed, timeout: a.timeout, in: a.in });
 
 // What the action actually landed on: a ref for the rest of this batch, and a
 // selector that will still mean the same thing next week. The bridge keys its
@@ -160,7 +160,7 @@ A.scroll = async (a) => {
     await BX.ensureVisible(box);
     return { scrolled: 'into-view', y: Math.round(scrollY) };
   }
-  const scroller = box || document.scrollingElement || document.documentElement;
+  const scroller = box || BX.scroller();
   const maxY = scroller.scrollHeight - scroller.clientHeight;
   let dx = 0, dy = 0;
   if (a.by) { dx = a.by[0] || 0; dy = a.by[1] ?? a.by; }
@@ -170,7 +170,10 @@ A.scroll = async (a) => {
   else dy = Math.round((scroller.clientHeight || innerHeight) * 0.85);
 
   const target = BX.at(BX.mouse.x, BX.mouse.y) || scroller;
-  const steps = a.speed === 'instant' ? 1 : Math.max(1, Math.min(14, Math.ceil(Math.abs(dy) / 220)));
+  // Hidden tabs get timers once a second, so a paced scroll there took 14s
+  // and timed out. BX.prof already drops to instant for hidden tabs.
+  const instant = a.speed === 'instant' || BX.prof(a.speed) === BX.PROFILES.instant;
+  const steps = instant ? 1 : Math.max(1, Math.min(14, Math.ceil(Math.abs(dy) / 220)));
   const chunk = dy / steps;
   for (let i = 0; i < steps; i++) {
     target.dispatchEvent(new WheelEvent('wheel', {
@@ -181,7 +184,7 @@ A.scroll = async (a) => {
     scroller.scrollBy ? scroller.scrollBy(dx / steps, chunk) : (scroller.scrollTop += chunk);
     if (steps > 1) await BX.sleep(10 + Math.random() * 18);
   }
-  await BX.sleep(a.settle ?? (a.speed === 'instant' ? 0 : 60));
+  await BX.sleep(a.settle ?? (instant ? 0 : 60));
   return { y: Math.round(scroller.scrollTop), max: Math.round(maxY), atBottom: scroller.scrollTop >= maxY - 2 };
 };
 
@@ -329,6 +332,9 @@ A.items = async (a) => {
     const link = el.matches('a[href]') ? el : el.querySelector('a[href]');
     return {
       i,
+      // A ref to the item itself, so the next command can act inside it:
+      // bx click text=Comment --in ref=e40.
+      ref: BX.ref(el, flat(el).slice(0, 90)),
       text: pieces(el).slice(0, cap),
       href: link ? link.href : undefined,
       sel: BX.durable(link || el)
@@ -392,10 +398,7 @@ A.nextpage = async () => {
 // Some apps scroll an inner element rather than the document, so take
 // whichever scrollable box is tallest.
 A.scrollend = async (a = {}) => {
-  let box = document.scrollingElement || document.documentElement;
-  for (const el of document.querySelectorAll('main, [role=main], [role=feed], div')) {
-    if (el.scrollHeight > el.clientHeight + 400 && el.scrollHeight > box.scrollHeight && /(auto|scroll)/.test(getComputedStyle(el).overflowY)) box = el;
-  }
+  const box = BX.scroller();
   const before = box.scrollHeight;
   box.scrollTop = box.scrollHeight;
   if (box === document.scrollingElement) window.scrollTo(0, box.scrollHeight);
@@ -426,7 +429,7 @@ A.fetchtext = async (a) => {
 };
 
 A.exists = async (a) => {
-  try { const el = await BX.want(a.target, { timeout: a.timeout ?? 0 }); return { exists: true, ...BX.describe(el), ...hit(el) }; }
+  try { const el = await BX.want(a.target, { timeout: a.timeout ?? 0, in: a.in }); return { exists: true, ...BX.describe(el), ...hit(el) }; }
   catch { return { exists: false }; }
 };
 
@@ -456,7 +459,7 @@ A.wait = async (a) => {
   let gap = 20;
   for (;;) {
     const p0 = performance.now();
-    if (a.for) { const el = BX.find(a.for); if (el) return { waited: Date.now() - t0, ...hit(el) }; }
+    if (a.for) { const el = BX.find(a.for, { in: a.in }); if (el) return { waited: Date.now() - t0, ...hit(el) }; }
     else if (a.gone) { if (!BX.find(a.gone)) return { waited: Date.now() - t0 }; }
     else if (a.text) { if ((document.body?.innerText || '').toLowerCase().includes(String(a.text).toLowerCase())) return { waited: Date.now() - t0 }; }
     else if (a.settle) {

@@ -201,7 +201,7 @@ function probeFrames(tabId, frames, action, cfg, budget) {
     const t = setTimeout(() => finish(null), budget + 500);
     const miss = () => { if (--left <= 0) finish(null); };
     for (const fid of frames) {
-      toFrame(tabId, fid, { a: 'exists', target: action.target, timeout: budget }, cfg)
+      toFrame(tabId, fid, { a: 'exists', target: action.target, in: action.in, timeout: budget }, cfg)
         .then((r) => (r && r.exists ? finish(fid) : miss()), miss);
     }
   });
@@ -419,7 +419,7 @@ async function shot(tabId, a, cfg) {
 
   let bmp = await dataUrlToBitmap(dataUrl);
   if (a.target) {
-    const box = await toContent(tabId, { a: 'box', target: a.target, timeout: a.timeout }, cfg);
+    const box = await toContent(tabId, { a: 'box', target: a.target, in: a.in, timeout: a.timeout }, cfg);
     const dpr = bmp.width / (await toContent(tabId, { a: 'info' }, cfg)).size[0];
     const pad = a.pad ?? 4;
     const crop = {
@@ -530,7 +530,7 @@ W.upload = async (tabId, a, cfg) => {
   // Path B: a custom widget — intercept the chooser the click would open. The
   // click has to be trusted: a synthetic one carries no user activation, and
   // input.click() on a file input is a no-op without it.
-  const box = await toContent(tabId, { a: 'box', target: a.target, timeout: a.timeout }, cfg);
+  const box = await toContent(tabId, { a: 'box', target: a.target, in: a.in, timeout: a.timeout }, cfg);
   return withCdp(tabId, async (t) => {
     await cdp(t, 'Page.enable');
     await cdp(t, 'Page.setInterceptFileChooserDialog', { enabled: true });
@@ -587,12 +587,12 @@ async function exec(tabId, a, cfg, batch) {
   // trusted:true (per action, or globally) routes input through CDP
   const trusted = a.trusted ?? batch.trusted;
   if (trusted && (a.a === 'click' || a.a === 'dblclick')) {
-    const box = await toContent(tabId, { a: 'box', target: a.target, timeout: a.timeout }, cfg);
+    const box = await toContent(tabId, { a: 'box', target: a.target, in: a.in, timeout: a.timeout }, cfg);
     return cdpClick(tabId, box.x + box.w / 2, box.y + box.h / 2, a.button === 'right' ? 'right' : 'left', a.a === 'dblclick' ? 2 : (a.clicks || 1));
   }
   if (trusted && a.a === 'type') {
-    await toContent(tabId, { a: 'click', target: a.target, speed: a.speed }, cfg);
-    if (a.clear !== false) await toContent(tabId, { a: 'clear', target: a.target }, cfg);
+    await toContent(tabId, { a: 'click', target: a.target, in: a.in, speed: a.speed }, cfg);
+    if (a.clear !== false) await toContent(tabId, { a: 'clear', target: a.target, in: a.in }, cfg);
     const r = await cdpType(tabId, a.text);
     if (a.enter) await withCdp(tabId, async (t) => {
       await cdp(t, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });

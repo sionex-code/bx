@@ -361,7 +361,12 @@ BX.candidates = (target) => {
 // the first in the tree — taking pool[0] off an unranked list is how an action
 // reports success against the wrong element.
 BX.matches = (target, opt = {}) => {
-  const list = BX.candidates(target);
+  let list = BX.candidates(target);
+  if (opt.in) {
+    const box = BX.candidates(opt.in).find(BX.visible) || BX.candidates(opt.in)[0];
+    if (!box) BX.notfound(opt.in);
+    list = list.filter((el) => el !== box && box.contains(el));
+  }
   const vis = list.filter(BX.visible);
   const pool = vis.length ? vis : opt.anyVisibility ? list : [];
   if (pool.length < 2) return pool;
@@ -400,6 +405,24 @@ BX.want = async (target, opt = {}) => {
     gap = Math.min(400, Math.max(gap * 1.3, cost));
     await BX.sleep(Math.min(gap, left));
   }
+};
+
+// The element that actually scrolls the page. Apps like LinkedIn keep the
+// document at window height and scroll an inner <main>, so window.scrollTo
+// and scrollingElement do nothing there — a feed run scrolled "to 1200" and
+// stayed at 0 for minutes. Take the tallest scrollable box when the document
+// itself cannot move.
+BX.scroller = () => {
+  const doc = document.scrollingElement || document.documentElement;
+  if (doc.scrollHeight > doc.clientHeight + 50) return doc;
+  let best = doc;
+  for (const el of document.querySelectorAll('main, [role=main], [role=feed], section, div')) {
+    if (el.scrollHeight > el.clientHeight + 200 && el.clientHeight > 200 && el.scrollHeight > (best === doc ? 0 : best.scrollHeight)) {
+      const oy = getComputedStyle(el).overflowY;
+      if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') best = el;
+    }
+  }
+  return best;
 };
 
 // ── geometry ─────────────────────────────────────────────────────────────
