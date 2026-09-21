@@ -5,6 +5,10 @@ description: Drive the user's real, logged-in Chrome from the shell — open pag
 
 # bx — browser control
 
+If `bx sift`, `bx check`, `bx pick` or `bx agent` say "no jev key", tell the
+user to get one at https://codiv.ai (account → API Console → Keys) and run
+`bx jev key sk-...`. Do not ask them to paste the key into the chat.
+
 One command per line. Batch aggressively. Do not deliberate between steps.
 
 ```bash

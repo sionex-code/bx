@@ -333,6 +333,31 @@ jev also sees screenshots. `check` and `pick` add one when the text answer
 is unsure or the question is about looks ("is the button greyed out"), and
 `--see` forces it.
 
+### Get a jev key (2 minutes)
+
+jev is a hosted model, so bx needs an API key. It is separate from your Claude
+or MiniMax key, and you only do this once.
+
+1. Go to **https://codiv.ai** and sign up or log in. (codiv.ai and TypeSafe are
+   the same service. `https://console.typesafe.ai/keys` is the console page
+   the key comes from.)
+2. Open the **API Console** from your account menu, then **Keys**, and create
+   a new key. Copy it now; it starts with `sk-`.
+3. Give it to bx:
+   ```bash
+   bx jev key sk-paste-your-key-here     # saved to ~/.bx/config.json, mode 0600
+   bx jev                                # should say the key is set; jev on
+   ```
+   Or, without saving it to disk: `export CODIV_API_KEY=sk-...` before starting
+   the bridge. `TYPESAFE_API_KEY` works too.
+4. Check it works: `bx open example.com` then `bx check "is this the example.com page"`
+   should answer `yes` in about a second.
+
+Pricing and free credit are on https://codiv.ai/pricing; usage per call is
+shown by `bx jev`. Without a key bx still drives your browser, but `sift`,
+`pick`, `check` and `bx agent` need one. Never paste your key into a chat with
+an agent or commit it: it is only stored on your machine.
+
 ### Setup
 
 ```bash
