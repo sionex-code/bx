@@ -31,6 +31,39 @@ const ms = (n) => dim(String(n).padStart(5) + 'ms');
 
 function die(msg, code = 1) { console.error(`${BAD} ${msg}`); process.exit(code); }
 
+// A key typed on the command line lands in shell history and in `ps`. With
+// no key argument, read it from a pipe, or ask for it without echoing.
+function secret(q) {
+  const i = process.stdin;
+  return new Promise((resolve) => {
+    if (!i.isTTY) { let d = ''; i.setEncoding('utf8'); i.on('data', (c) => (d += c)); i.on('end', () => resolve(d.trim())); return; }
+    process.stderr.write(q);
+    i.setRawMode(true); i.resume(); i.setEncoding('utf8');
+    let d = '';
+    const on = (c) => {
+      for (const ch of c) {
+        if (ch === '\r' || ch === '\n') { i.setRawMode(false); i.pause(); i.removeListener('data', on); process.stderr.write('\n'); return resolve(d.trim()); }
+        if (ch === '\u0003') { i.setRawMode(false); process.stderr.write('\n'); process.exit(130); }
+        if (ch === '\u007f') d = d.slice(0, -1); else d += ch;
+      }
+    };
+    i.on('data', on);
+  });
+}
+
+// One line per key: whose it is, its label, the masked key, how it is doing.
+function printKeys(keys) {
+  if (!keys.length) return console.log(`  ${dim('no keys —')} bx jev key ${dim('(TypeSafe apikey_… from console.typesafe.ai/keys, codiv sk-codiv-… from codiv.ai/dashboard)')}`);
+  const w = Math.max(...keys.map((k) => k.label.length), 5);
+  for (const k of keys) {
+    const st = k.status === 'ok' ? grn('ok') : /refused/.test(k.status) ? red(k.status) : yel(k.status + (k.back_in_s ? ` ${k.back_in_s}s` : ''));
+    const use = k.calls ? dim(` ${k.calls} call${k.calls === 1 ? '' : 's'}, ${k.avg_ms}ms avg${k.failed ? `, ${k.failed} failed` : ''}`) : '';
+    console.log(`  ${k.provider.padEnd(9)} ${bold(k.label.padEnd(w))}  ${k.key}  ${st}${use}  ${dim(k.id)}`);
+    if (k.last_error && k.status !== 'ok') console.log(`  ${' '.repeat(9)} ${dim(trunc(k.last_error, 90))}`);
+  }
+}
+const routeLine = (j) => `text → ${j.route.text ? bold(j.route.text) : red('none')} ${DOT} screenshots → ${j.route.images ? bold(j.route.images) : dim('none (TypeSafe is text only; a codiv key lets jev see)')}`;
+
 // ── config / transport ───────────────────────────────────────────────────
 function config() {
   try { return JSON.parse(fs.readFileSync(CFG_PATH, 'utf8')); }
@@ -122,18 +155,22 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a.startsWith('--')) {
     const [k, v] = a.slice(2).split('=');
-    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out', 'last', 'if', 'check', 'do', 'with', 'without', 'in'].includes(k) ? argv[++i] : true) : v;
+    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out', 'last', 'if', 'check', 'do', 'with', 'without', 'in', 'label', 'provider'].includes(k) ? argv[++i] : true) : v;
   } else args.push(a);
 }
 const num = (v) => (v === undefined ? undefined : Number(v));
 
 const common = () => ({
-  tab: flags.tab === undefined ? 'active' : /^\d+$/.test(flags.tab) ? Number(flags.tab) : flags.tab,
+  // --here: the tab the user is looking at, even when bx works in its own window.
+  tab: flags.here ? 'user' : flags.tab === undefined ? 'active' : /^\d+$/.test(flags.tab) ? Number(flags.tab) : flags.tab,
   speed: flags.speed,
   trusted: flags.trusted ? true : undefined,
   timeout: num(flags.timeout),
   inline: flags.inline ? true : undefined,
-  stopOnError: flags.keepgoing ? false : undefined
+  stopOnError: flags.keepgoing ? false : undefined,
+  // jev picks among several matches and names the likely one on a miss;
+  // --no-jev puts the target back to plain first-match.
+  pick: flags['no-jev'] || flags.nojev ? false : undefined
 });
 
 // ── rendering ────────────────────────────────────────────────────────────
@@ -222,7 +259,12 @@ function render(out) {
 
   for (const r of out.results || []) {
     const head = `${r.ok ? OK : BAD} ${bold(r.a.padEnd(9))} ${ms(r.ms)}`;
-    if (!r.ok) { console.log(`${head}  ${red(trunc(r.error, 140))}`); continue; }
+    if (!r.ok) {
+      console.log(`${head}  ${red(trunc(r.error, 140))}`);
+      if (r.picked?.unsure && r.picked.ref) console.log(`  ${mag('▸ jev')} ${dim(`leans to ${r.picked.ref} of the ${r.picked.of} matches, but only`)} ${pct(r.picked.confidence)} ${dim(`sure — bx ${r.a} ref=${r.picked.ref} if that is it`)}`);
+      if (r.suggest) console.log(`  ${mag('▸ jev')} ${dim('closest match on the page:')} ${yel(r.suggest.ref)} ${trunc(r.suggest.label, 60)} ${pct(r.suggest.confidence)}  ${dim(`→ bx ${r.a} ref=${r.suggest.ref}`)}`);
+      continue;
+    }
     console.log(`${head}  ${summary(r.a, r.r)}${amb(r.r)}`);
     detail(r.a, r.r);
   }
@@ -332,7 +374,14 @@ function agentEnd(out) {
 // An ambiguous target is not an error, so it never reaches the red path — but
 // it is the single most likely reason a step "worked" and nothing happened.
 const amb = (r) =>
-  (r && r.n > 1 ? yel(`  ${DOT} ${r.n} matched`) : '') +
+  (r && r.picked ? (r.picked.unsure
+    ? yel(`  ${DOT} ${r.picked.of} matched, jev unsure `) + pct(r.picked.confidence) + yel(' — took the first')
+    : r.picked.by === 'layout'
+      ? mag(`  ${DOT} ${r.picked.of} matched, jev unsure `) + pct(r.picked.confidence) + mag(' — took the one right after your unsent text')
+      : mag(`  ${DOT} jev chose 1 of ${r.picked.of} `) + pct(r.picked.confidence)) : '') +
+  // Only an element action's own match count; `tabs` and `elements` carry an
+  // `n` too, which is just how many there are.
+  (r && !r.picked && r.ref && r.n > 1 ? yel(`  ${DOT} ${r.n} matched`) : '') +
   (r && r.inert ? red(`  ${DOT} disabled`) : '') +
   (r && r.healed ? dim(`  ${DOT} ref ${r.healed} was stale, re-found by its text as ${r.ref}`) : '');
 
@@ -375,7 +424,8 @@ function detail(a, r) {
     if (r.n >= 60 && !flags.max) console.log(dim(`  … stopped at 60 — bx els "<css of the part you want>", bx pick "<what you want>", or --max N`));
   }
   if (a === 'tabs') for (const t of r.tabs) {
-    console.log(`  ${(t.active ? grn('▸') : ' ')} ${yel(String(t.id).padEnd(6))} ${trunc(t.title, 46).padEnd(46)} ${dim(t.url)}`);
+    const mark = t.work ? mag('bx▸') : t.bx ? mag('bx ') : t.active ? grn(' ▸ ') : '   ';
+    console.log(`  ${mark} ${yel(String(t.id).padEnd(6))} ${trunc(t.title, 46).padEnd(46)} ${dim(t.url)}`);
   }
   if (a === 'read' && r.links) for (const l of r.links) console.log(`  ${trunc(l.text, 44).padEnd(44)} ${dim(l.href)}`);
   if (a === 'fill') for (const d of r.detail) if (!d.ok) console.log(`  ${BAD} ${d.sel} ${red(trunc(d.error, 80))}`);
@@ -425,7 +475,10 @@ ${bold('agent')}  ${dim('jev decides the next move from the live page — on by 
                               ${dim('--with T / --without T for an exact text rule')}),
                               open each, ask Q about it, run the batch if yes  ${dim('{{name}} {{first}} {{text}} {{href}}')}
                               ${dim('--dry  --max N (20)  --budget S (90)  --keepgoing  --fresh')}
-  jev [key|on|off|model|set|ask]
+  jev [key|keys|rm|use|on|off|model|set|ask]
+                              ${dim('key: add a TypeSafe (apikey_…) or codiv (sk-codiv-…) key, asked for hidden; any number of each')}
+                              ${dim('use auto|typesafe|codiv  ·  rm <id|label>  ·  set parallel=N (16)')}
+  ext [allow|forget <id>]     ${dim('browsers with bx connected; let in bx loaded from another folder')}
 
 ${bold('page')}
   open <url>                  navigate current tab
@@ -452,8 +505,9 @@ ${bold('act')}
   wait <target>               ${dim('--gone --text "..." --ms N')}
   eval <js>
 
-${bold('tabs')}
-  tabs | tab <id|match> | newtab [url] | close [id]
+${bold('tabs')}  ${dim('by default bx works in its own "bx" window and never touches yours (switch: bx toolbar popup)')}
+  tabs | tab <id|match> | newtab [url] | close [id]   ${dim('bx▸ = the tab bx acts on')}
+  --here                      ${dim('act on the tab you are looking at, for this one command')}
 
 ${bold('memory')}  ${dim('bx learns every site as you drive it — flows, selectors, traps')}
   memo [host]                 everything known about a site   ${dim('--all to list sites')}
@@ -468,8 +522,9 @@ ${bold('bridge')}
   do '<json>'                 raw batch: ${dim(`'[{"a":"click","target":"text=Next"}]'`)}
 
 ${bold('targets')}  ${dim('css  ·  text=Sign in  ·  ref=e12  ·  role=button:Save  ·  label=Email  ·  placeholder=Search  ·  name=q  ·  xpath=//a')}
-         ${dim('several matches? bx picks the enabled one, prints "N matched" and lists the rest as refs.')}
-         ${dim('narrow with  --has TEXT  --near SEL  --nth N,  or click the ref it showed you.')}
+         ${dim('several matches? jev picks the one meant — from what was just typed and the post or row')}
+         ${dim('each sits in — and says "jev chose 1 of N". A target that matches nothing comes back with')}
+         ${dim('jev\'s closest match as a ref. --no-jev: plain first match. Narrow by hand with --has --near --nth.')}
 ${bold('flags')}    ${dim('--tab <id> --speed <p> --timeout <ms> --json --keepgoing')}
          ${dim('--in <target>  act only inside that element: bx do --in ref=e40 \'[…]\', bx click text=Comment --in ref=e40')}
 `;
@@ -579,9 +634,33 @@ async function main() {
       const s = await api('GET', '/status');
       if (flags.json) return void console.log(JSON.stringify(s, null, 2));
       console.log(`  bridge     ${grn('up')}  ${dim('127.0.0.1:' + s.port + '  pid ' + s.pid)}`);
-      console.log(`  extension  ${s.connected ? grn('connected') : red('not connected')}  ${dim(s.extension.id || '')}`);
+      console.log(`  extension  ${s.connected ? grn('connected') : red('not connected')}  ${dim((s.extension.ids || [s.extension.id]).filter(Boolean).join(', '))}`);
+      // Several Chrome profiles with bx loaded each connect; say which one
+      // "the active tab" means, since that is what every command acts on.
+      const inst = s.instances || [];
+      const p = inst.find((x) => x.primary) || {};
+      if (inst.length > 1) {
+        const names = inst.map((x) => `${x.browser || 'browser'}${x.primary ? '*' : ''}`).join(', ');
+        console.log(`             ${dim(`${inst.length} browsers/profiles have bx (${names}) — commands go to the one last in use (* · ${p.windows ?? '?'} windows, ${p.tabs ?? '?'} tabs); bx ext lists them`)}`);
+      }
+      for (const x of s.refused || []) {
+        console.log(`  ${yel('▲')} ${yel(`an extension with another id tried to connect (${x.browser || 'a browser'}, ${x.tries} tries)`)} ${dim('— bx loaded from a different folder.')} ${dim('If it is yours:')} bx ext allow ${x.id}`);
+      }
+      // The trap behind a 90-minute "no active tab" stall: the profile that
+      // answered was an idle one with nothing open, and the profile actually
+      // being browsed in had a bx that was not connected at all.
+      if (s.connected && p.own !== undefined) {
+        console.log(`  tabs       ${p.own
+          ? `${bold('own window')} ${dim(`— bx works in its "bx" window, your tabs are left alone${p.bxWindow ? '' : ' (opens on the first command)'}; --here for yours`)}`
+          : `${bold('your tab')} ${dim('— bx acts on the tab you are looking at')}`} ${dim('· switch in the bx toolbar popup')}`);
+      }
+      if (s.connected && p.windows === 0) {
+        console.log(`  ${yel('▲')} ${yel('the connected Chrome profile has no window of yours open')} ${dim(`— commands will open ${p.own ? 'bx\'s window' : 'one'} there.`)}`);
+        console.log(`    ${dim('If you browse in another profile, its bx is not connected: reload bx at')} ${blu('chrome://extensions')} ${dim('in that profile.')}`);
+      }
       console.log(`  input      ${s.trusted ? mag('CDP trusted') : 'synthetic'} ${dim('·')} speed ${bold(s.speed)} ${dim('·')} timeout ${s.timeout}ms`);
-      console.log(`  brain      ${s.jev?.enabled ? (s.jev.ready ? grn('jev ' + s.jev.model) : yel('jev on, no key — bx jev key sk-codiv-…')) : dim('jev off')}`);
+      const j = s.jev || {};
+      console.log(`  brain      ${j.enabled ? (j.ready ? `${grn('jev')} ${dim(j.provider)} ${DOT} text → ${bold(j.route.text)} ${dim(j.models[j.route.text])} ${DOT} screenshots → ${j.route.images ? bold(j.route.images) : dim('none')} ${dim(`· ${j.keys} key${j.keys === 1 ? '' : 's'}`)}` : yel('jev on, no key — bx jev key  (or the bx toolbar popup)')) : dim('jev off')}`);
       console.log(`  config     ${dim(CFG_PATH)}`);
       if (!s.connected) console.log(`\n  ${yel('→')} load ${bold(path.join(ROOT, 'extension'))} at ${blu('chrome://extensions')} (Developer mode → Load unpacked)`);
       return;
@@ -776,7 +855,7 @@ async function main() {
       const end = await stream('/each', {
         tab: common().tab, target: args[0] || flags.target, if: flags.if, check: flags.check, do: doActs,
         with: typeof flags.with === 'string' ? flags.with : undefined, without: typeof flags.without === 'string' ? flags.without : undefined,
-        max: num(flags.max), dry: !!flags.dry, see: see(), budget: budget ? budget * 1000 : 0,
+        max: num(flags.max), dry: !!flags.dry, see: see(), budget: budget ? budget * 1000 : 0, pick: common().pick,
         stopOnError: flags.keepgoing ? false : undefined, skip: [...skip]
       }, (x) => {
         delete x.t;
@@ -833,36 +912,98 @@ async function main() {
 
     case 'jev': {
       const sub = args.shift();
-      if (sub === 'key') {
-        const k = args[0] || flags.key;
-        if (!k) die('bx jev key sk-codiv-...');
-        const r = await api('POST', '/jev', { api_key: k, enabled: true });
-        console.log(`${OK} key stored in ${dim(CFG_PATH)} ${dim('(0600)')}`);
+      if (sub === 'key' || sub === 'add') {
+        const k = (args[0] && args[0] !== '-' ? args[0] : null) || (typeof flags.key === 'string' ? flags.key : null) || await secret('paste the key (hidden): ');
+        if (!k) die('bx jev key   (asks for it)  or  … | bx jev key -    TypeSafe apikey_… or codiv sk-codiv-…  --label NAME --provider typesafe|codiv');
+        const r = await api('POST', '/jev/keys', { key: k, label: typeof flags.label === 'string' ? flags.label : undefined, provider: flags.provider, test: flags['no-test'] ? false : undefined });
+        if (!r.ok) die(r.error);
+        if (r.existing) { console.log(`${OK} already there as ${bold(r.label)} ${dim(`(${r.provider}, ${r.id})`)}`); return; }
+        console.log(`${OK} ${bold(r.label)} added ${dim(`— ${r.provider}, id ${r.id}, stored in ${CFG_PATH} (0600)`)}`);
+        if (r.test) console.log(r.test.ok ? `  ${dim(`works: ${r.test.model} answered in ${r.test.ms}ms`)}` : `  ${yel('▲ saved, but the test call failed:')} ${dim(r.test.error)}`);
+        console.log(`  ${routeLine(r.jev)}`);
+        return;
+      }
+      if (sub === 'keys') {
+        const r = await api('GET', '/jev');
+        if (flags.json) { console.log(JSON.stringify(r.keys, null, 2)); return; }
+        printKeys(r.keys);
+        return;
+      }
+      if (sub === 'rm' || sub === 'remove') {
+        if (!args[0]) die('bx jev rm <id | label | last 4 characters>   (bx jev keys lists them)');
+        const r = await api('POST', '/jev/keys/remove', { id: args[0] });
+        if (!r.ok) die(r.error);
+        console.log(`${OK} removed ${bold(r.removed.label)} ${dim(`(${r.removed.provider})`)}`);
+        console.log(`  ${routeLine(r.jev)}`);
+        return;
+      }
+      if (sub === 'use') {
+        if (!['auto', 'typesafe', 'codiv'].includes(args[0])) die('bx jev use auto|typesafe|codiv');
+        const r = await api('POST', '/jev', { provider: args[0] });
+        if (!r.ok) die(r.error);
+        console.log(`${OK} ${bold(args[0])}  ${routeLine(r.jev)}`);
         return;
       }
       if (sub === 'on' || sub === 'off') { await api('POST', '/jev', { enabled: sub === 'on' }); console.log(`${OK} jev ${sub}`); return; }
-      if (sub === 'model') { const r = await api('POST', '/jev', { model: args[0] }); console.log(`${OK} model ${bold(r.jev.model)}`); return; }
+      if (sub === 'model') {
+        if (!args[0]) die('bx jev model <name>   e.g. jev-1.13.0 (TypeSafe), openjev-0.1 (codiv)');
+        const r = await api('POST', '/jev', { model: args[0] });
+        if (!r.ok) die(r.error);
+        for (const [p, v] of Object.entries(r.jev.providers)) console.log(`  ${p.padEnd(9)} ${bold(v.model)}`);
+        return;
+      }
       if (sub === 'set') {
         const patch = {};
         for (const a of args) { const [k, v] = a.split('='); patch[k] = /^[\d.]+$/.test(v) ? Number(v) : v === 'true' ? true : v === 'false' ? false : v; }
         const r = await api('POST', '/jev', patch);
-        console.log(JSON.stringify(r.jev, null, 2));
+        if (!r.ok) die(r.error);
+        const { keys, usage, ...rest } = r.jev;
+        console.log(JSON.stringify(rest, null, 2));
         return;
       }
       if (sub === 'ask') {
         let questions;
         try { questions = JSON.parse(args.join(' ')); } catch { die(`bx jev ask '{"urgent":{"type":"noul","instructions":"..."}}'`); }
-        const r = await api('POST', '/jev/ask', { questions, page: true, tab: common().tab, state: flags.state });
+        const r = await api('POST', '/jev/ask', { questions, page: true, tab: common().tab, state: flags.state, provider: flags.provider });
         console.log(JSON.stringify(r, null, 2));
         return;
       }
+      if (sub) die(`bx jev ${sub}? — key, keys, rm, use, on, off, model, set, ask`);
       const r = await api('GET', '/jev');
       if (flags.json) { console.log(JSON.stringify(r, null, 2)); return; }
-      console.log(`${r.ready ? OK : BAD} jev ${r.enabled ? grn('on') : yel('off')}${r.ready ? '' : red('  no key — bx jev key sk-codiv-…')}`);
-      console.log(`  ${dim('model')}      ${bold(r.model)}   ${dim(r.base)}`);
-      if (r.key) console.log(`  ${dim('key')}        ${r.key} ${dim(`(${r.source})`)}`);
+      console.log(`${r.ready ? OK : BAD} jev ${r.enabled ? grn('on') : yel('off')} ${DOT} ${bold(r.provider)}${r.ready ? '' : red('  no key — bx jev key')}`);
+      console.log(`  ${routeLine(r)}`);
+      for (const [p, v] of Object.entries(r.providers)) if (v.keys) console.log(`  ${dim(p.padEnd(9))}  ${v.model}  ${dim(v.base)}`);
+      console.log(`  ${dim('keys')}`);
+      printKeys(r.keys);
       console.log(`  ${dim('floor')}      ${r.min_confidence} ${dim('— below this the agent stops and hands back')}`);
+      console.log(`  ${dim('parallel')}   ${r.parallel} calls at once ${dim(`— peak so far ${r.usage.peak || 0}${r.usage.inflight ? `, ${r.usage.inflight} in flight` : ''}; bx jev set parallel=N`)}`);
       console.log(`  ${dim('used')}       ${r.usage.calls} calls${r.usage.failed ? red(`, ${r.usage.failed} failed`) : ''}${r.usage.calls ? dim(`, ${r.usage.avg_ms}ms avg, ${r.usage.input_tokens} input tokens`) : ''}`);
+      return;
+    }
+
+    // ── extensions: which browsers may connect ──────────────────────────
+    case 'ext': {
+      const sub = args.shift();
+      if (sub === 'allow' || sub === 'forget') {
+        if (!args[0]) die(`bx ext ${sub} <extension id>   (bx ext lists them)`);
+        const r = await api('POST', `/ext/${sub}`, { id: args[0] });
+        if (!r.ok) die(r.error);
+        console.log(`${OK} ${sub === 'allow' ? 'allowed — that browser connects within a few seconds' : 'no longer allowed'}`);
+        return;
+      }
+      if (sub) die(`bx ext ${sub}? — allow <id>, forget <id>`);
+      const r = await api('GET', '/ext');
+      if (flags.json) { console.log(JSON.stringify(r, null, 2)); return; }
+      console.log(`${bold('connected')}`);
+      if (!r.browsers.length) console.log(`  ${dim('none')}`);
+      for (const b of r.browsers) console.log(`  ${(b.browser || '?').padEnd(10)} ${dim(`profile ${b.iid}`)}  ${b.windows ?? '?'} windows, ${b.tabs ?? '?'} tabs${b.primary ? grn('  ← commands go here') : ''}  ${dim(b.ext || '')}`);
+      console.log(`${bold('allowed')}`);
+      for (const id of r.allowed) console.log(`  ${id}`);
+      if (r.refused.length) {
+        console.log(`${bold('refused')} ${dim('— bx loaded from another folder has another id')}`);
+        for (const x of r.refused) console.log(`  ${yel(x.id)}  ${dim(`${x.browser || ''}, ${x.tries} tries`)}  ${dim('→')} bx ext allow ${x.id}`);
+      }
       return;
     }
 

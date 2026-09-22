@@ -19,7 +19,10 @@ const SHOTS = path.join(HOME, 'shots');
 const DEFAULTS = {
   port: 8787,
   token: null,
-  extension_id: null,
+  // The extensions allowed to connect. The first one ever to connect is
+  // trusted on its own; any other (bx loaded from a second folder, in another
+  // browser) waits until `bx ext allow <id>`.
+  extension_ids: [],
   speed: 'fast',        // instant | fast | human
   trusted: false,       // force CDP-trusted input for every click/type
   timeout: 8000,
@@ -30,9 +33,10 @@ const DEFAULTS = {
   // and without a key it simply reports itself as off instead of breaking.
   jev: {
     enabled: true,
-    api_key: null,
-    base: 'https://api.codiv.ai',
-    model: 'openjev-latest',
+    // auto: text to TypeSafe, screenshots to codiv, each falling back to the
+    // other. typesafe / codiv: that one only (a screenshot still needs codiv).
+    provider: 'auto',
+    keys: [],               // [{id, provider, label, key, added}], any number of each
     timeout: 15000,
     steps: 1,               // denoise iterations, 1-8: more is steadier, slower
     samples: 1,             // repeated reads averaged, 1-32
@@ -43,7 +47,8 @@ const DEFAULTS = {
     // with a screenshot only when the answer is below the floor — seeing the
     // page costs ~2.5s more a call, and text settles most decisions alone.
     // 'always' attaches one every time; 'off' never does.
-    see: 'auto'
+    see: 'auto',
+    parallel: 16            // jev calls in flight at once, 1-64
   }
 };
 
@@ -54,10 +59,35 @@ function loadConfig() {
   try { cfg = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8')); } catch {}
   cfg = Object.assign({}, DEFAULTS, cfg);
   cfg.jev = Object.assign({}, DEFAULTS.jev, cfg.jev || {});
+  migrate(cfg);
   if (!cfg.token) cfg.token = crypto.randomBytes(24).toString('base64url');
   saveConfig(cfg);
   return cfg;
 }
+
+// Configs from before multiple keys held one key, one base and one model,
+// all codiv's, and one trusted extension id.
+function migrate(cfg) {
+  const j = cfg.jev;
+  // Copies, so nothing pushed here lands in DEFAULTS.
+  j.keys = Array.isArray(j.keys) ? [...j.keys] : [];
+  const was = /typesafe/.test(j.base || '') ? 'typesafe' : 'codiv';
+  if (j.api_key) {
+    if (!j.keys.some((k) => k.key === j.api_key)) {
+      j.keys.push({ id: keyId(), provider: jev.providerOf(j.api_key) || was, label: 'default', key: j.api_key, added: Date.now() });
+    }
+  }
+  // A base or model that is not the old default was set on purpose (a
+  // self-hosted OpenJev, a pinned version): keep it, on the provider it was for.
+  if (j.base && j.base.replace(/\/+$/, '') !== jev.PROVIDERS[was].base) j[was] = { ...(j[was] || {}), base: j.base };
+  if (j.model && j.model !== jev.PROVIDERS[was].model) j[was] = { ...(j[was] || {}), model: j.model };
+  delete j.api_key; delete j.base; delete j.model;
+  cfg.extension_ids = Array.isArray(cfg.extension_ids) ? [...cfg.extension_ids] : [];
+  if (cfg.extension_id && !cfg.extension_ids.includes(cfg.extension_id)) cfg.extension_ids.push(cfg.extension_id);
+  delete cfg.extension_id;
+}
+
+const keyId = () => crypto.randomBytes(4).toString('hex');
 function saveConfig(cfg) {
   fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
 }
@@ -65,10 +95,15 @@ function saveConfig(cfg) {
 const CFG = loadConfig();
 
 // ── state ────────────────────────────────────────────────────────────────
-let ext = null;                 // live extension socket
-let extMeta = { id: null, since: 0, ua: null };
-let lastBeat = 0;               // last keepalive echo from the extension
-const pending = new Map();      // id -> {resolve, reject, timer, t0}
+// One socket per Chrome profile that has bx loaded. Chrome runs a copy of the
+// extension in each, and every copy dials this bridge. Keeping only the newest
+// socket had two profiles knock each other off every few seconds: a command
+// landing on the profile with no window failed "no active tab", one caught
+// mid-swap failed "extension disconnected", and an agent retried both for an
+// hour and a half.
+const exts = new Map();         // socket -> {iid, since, beat, ua, chrome, windows, tabs, used, focusedAt}
+const owner = new Map();        // tab id -> the socket whose profile holds that tab
+const pending = new Map();      // id -> {resolve, reject, timer, t0, ws}
 const log = [];
 let seq = 0;
 let lastHost = null;           // whatever the last batch was mostly about
@@ -78,32 +113,75 @@ function note(kind, data) {
   if (log.length > CFG.log_max) log.splice(0, log.length - CFG.log_max);
 }
 
+// Where "the active tab" is: a profile with a window beats one without (an
+// extension too old to say sits between), then the one used most recently.
+function primary() {
+  const hasWin = (m) => (m.windows === undefined ? 1 : m.windows > 0 ? 2 : 0);
+  const recent = (m) => Math.max(m.focusedAt || 0, m.used || 0);
+  let best = null;
+  for (const [ws, m] of exts) {
+    const b = best && exts.get(best);
+    if (!b || hasWin(m) > hasWin(b) || (hasWin(m) === hasWin(b) && (recent(m) > recent(b) || (recent(m) === recent(b) && m.since > b.since)))) best = ws;
+  }
+  return best;
+}
+const connected = () => exts.size > 0;
+const broadcast = (s) => { for (const ws of exts.keys()) { try { ws.send(s); } catch {} } };
+
 // Chrome may have torn the extension's service worker down for being idle; it
 // dials back in a moment after any browser event wakes it. Waiting 2.5s at 60ms
 // resolution was often just short enough to report "not connected" on a browser
 // that was about to be perfectly usable.
 function waitForExt(ms) {
-  if (ext) return Promise.resolve(true);
+  if (connected()) return Promise.resolve(true);
   return new Promise((resolve) => {
     const t0 = Date.now();
     const tick = setInterval(() => {
-      if (ext || Date.now() - t0 > ms) { clearInterval(tick); resolve(!!ext); }
+      if (connected() || Date.now() - t0 > ms) { clearInterval(tick); resolve(connected()); }
     }, 20);
   });
 }
 
-function call(payload, timeoutMs) {
+// Remember which profile holds each tab an answer mentions, so a batch aimed
+// at tab 1234 goes to the profile that has it.
+function own(out, ws) {
+  if (!out) return;
+  if (typeof out.tab === 'number') owner.set(out.tab, ws);
+  for (const r of out.results || []) {
+    if (!r.ok || !r.r) continue;
+    if (r.a === 'tabs') for (const t of r.r.tabs || []) owner.set(t.id, ws);
+    if ((r.a === 'newtab' || r.a === 'tab') && typeof r.r.id === 'number') owner.set(r.r.id, ws);
+  }
+}
+
+function callOn(ws, payload, timeoutMs) {
   return new Promise((resolve, reject) => {
-    if (!ext) return reject(new Error('extension not connected'));
     const id = ++seq;
     const t0 = Date.now();
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(new Error(`timeout after ${timeoutMs}ms`));
     }, timeoutMs);
-    pending.set(id, { resolve, reject, timer, t0 });
-    ext.send(JSON.stringify({ ...payload, id }));
+    pending.set(id, { resolve: (r) => { own(r, ws); resolve(r); }, reject, timer, t0, ws });
+    ws.send(JSON.stringify({ ...payload, id }));
   });
+}
+
+function call(payload, timeoutMs) {
+  const tab = payload.tab;
+  const pinned = tab !== undefined && tab !== 'active' && tab !== 'current';
+  const first = typeof tab === 'number' && exts.has(owner.get(tab)) ? owner.get(tab) : primary();
+  if (!first) return Promise.reject(new Error('extension not connected'));
+  // A tab named by id or by a piece of its title may live in another profile
+  // this bridge has not heard about yet: ask the others before giving up.
+  let p = callOn(first, payload, timeoutMs);
+  if (pinned) {
+    for (const ws of exts.keys()) {
+      if (ws === first) continue;
+      p = p.catch((e) => (/no tab matching|No tab with id/i.test(String(e.message)) && exts.has(ws) ? callOn(ws, payload, timeoutMs) : Promise.reject(e)));
+    }
+  }
+  return p;
 }
 
 // ── screenshot spill: results carrying {__img:{b64,ext}} become files ─────
@@ -175,7 +253,9 @@ async function snap(tab) {
 const VISUAL = /\b(colou?rs?|red|green|blue|yellow|orange|grey|gray|black|white|dark|light|theme|looks?|appear(s|ance)?|visible|visually|icons?|images?|photos?|pictures?|logos?|avatar|charts?|graphs?|greyed|grayed|highlighted|bold|layout|overlaps?|overlay|modal|popup|pop-up|spinner|captcha|outlined|filled|font|screenshot|rendered|blank|empty page|broken)\b/i;
 
 // Per call: an explicit see:true/false wins, otherwise the configured mode.
-const seeMode = (b) => (b.see === true ? 'always' : b.see === false ? 'off' : (CFG.jev.see || 'auto'));
+// With no key for a service that reads images (TypeSafe is text only) a
+// screenshot would be taken and then dropped, so none is taken.
+const seeMode = (b) => (!jev.canSee(CFG.jev) || b.see === false ? 'off' : b.see === true ? 'always' : (CFG.jev.see || 'auto'));
 
 // Ask once from text; if the answer is not good enough and a screenshot is
 // allowed, ask again with the page's picture attached. `weak` decides what
@@ -185,13 +265,11 @@ async function askSeeing(b, st, qs, over, weak, about) {
   const upfront = mode === 'always' || (mode === 'auto' && VISUAL.test(about || ''));
   const img = upfront ? await snap(b.tab) : null;
   let out = await jev.ask(st, qs, CFG.jev, { ...over, images: img ? [img] : undefined });
-  out.saw = !!img;
   if (!img && mode === 'auto' && weak(out)) {
     const shot = await snap(b.tab);
     if (shot) {
       const again = await jev.ask(st, qs, CFG.jev, { ...over, images: [shot] });
       again.ms += out.ms;
-      again.saw = true;
       out = again;
     }
   }
@@ -278,7 +356,7 @@ async function judge(b, page) {
       criteria: { true: 'The item satisfies the criterion.', false: 'It does not, or its text does not show that it does.' }
     };
   }
-  const img = b.see === true || CFG.jev.see === 'always' ? await snap(b.tab) : null;
+  const img = seeMode(b) === 'always' ? await snap(b.tab) : null;
   // Ten questions a call, the calls in parallel. Measured on 40 Fiverr gigs
   // against "an AI or machine learning gig": all 40 in one call got 24 wrong,
   // four calls of 10 got none wrong, and took the same ~1.3s.
@@ -289,19 +367,20 @@ async function judge(b, page) {
   // jev down (overloaded for a minute and a half on one run) used to fail the
   // whole sift, and the agent slept and retried with nothing to show. The
   // list itself is still worth having: hand it back unjudged.
-  let down = null;
+  let down = null, saw = false, model = null;
   await Promise.all(chunks.map(async (chunk) => {
     const part = {};
     for (const x of chunk) part[`i${x.i}`] = qs[`i${x.i}`];
     try {
       const out = await jev.ask(st, part, CFG.jev, { sequential: false, images: img ? [img] : undefined });
       Object.assign(answers, out.answers);
+      saw = saw || out.saw; model = model || out.model;
     } catch (e) { down = String(e.message || e); }
   }));
   return items.map((x) => {
-    if (!answers[`i${x.i}`]) return { ...x, keep: null, unjudged: down || 'no answer', saw: !!img };
+    if (!answers[`i${x.i}`]) return { ...x, keep: null, unjudged: down || 'no answer', saw };
     const a = jev.read(answers[`i${x.i}`]);
-    return { ...x, keep: !!a.value, p: a.p, saw: !!img };
+    return { ...x, keep: !!a.value, p: a.p, saw, model };
   });
 }
 
@@ -413,16 +492,16 @@ async function checkOne(url, list, b) {
   let g = await grab(url, b, { shot: visual });
   try {
     let [o, rd] = await Promise.all([jev.ask(stateOf(g), qs, CFG.jev, { images: g.img ? [g.img] : undefined }), readable(stateOf(g))]);
-    let saw = !!g.img;
+    let saw = o.saw;
     // Not sure from the fetched HTML, or the HTML was not the page: render
     // it properly and ask again.
     if (g.via === 'fetch' && (weak(o) || unreadable(rd, g.text))) {
       g = await grab(url, { ...b, fetch: false }, { shot: mode === 'auto' });
       [o, rd] = await Promise.all([jev.ask(stateOf(g), qs, CFG.jev, { images: g.img ? [g.img] : undefined }), readable(stateOf(g))]);
-      saw = !!g.img;
+      saw = o.saw;
     } else if (g.via === 'tab' && !g.img && mode === 'auto' && weak(o)) {
       const s2 = (await runBatch({ tab: g.id, memory: false, inline: true, stopOnError: false, actions: [{ a: 'shot', maxWidth: 1024, quality: 60 }] })).results[0]?.r;
-      if (s2?.inline) { o = await jev.ask(stateOf(g), qs, CFG.jev, { images: [`data:${s2.mime || 'image/jpeg'};base64,${s2.inline}`] }); saw = true; }
+      if (s2?.inline) { o = await jev.ask(stateOf(g), qs, CFG.jev, { images: [`data:${s2.mime || 'image/jpeg'};base64,${s2.inline}`] }); saw = o.saw; }
     }
     const why = unreadable(rd, g.text, saw);
     return { url, title: g.title, via: g.via, saw, ...(why ? { unreadable: why } : {}), answers: answer(o, why), ms: Date.now() - t0 };
@@ -463,6 +542,164 @@ async function checkHere(b, list) {
     return { question: q, answer: a.value, p: a.p, confidence: a.confidence };
   });
   return { ok: true, url: look.url, title: page.title, ...(why ? { unreadable: why } : {}), answers, ms: out.ms, model: out.model, saw: out.saw };
+}
+
+// "Which thing on this page is the X?" Asked by `bx pick`, and on bx's own
+// behalf when a target matched nothing, so the miss comes back with the
+// element that was probably meant.
+async function pickOne(b) {
+  const look = await runBatch({ tab: b.tab ?? 'active', memory: false, stopOnError: false,
+    actions: [{ a: 'wait', settle: true, timeout: 3000 }, { a: 'elements', max: b.max || CFG.jev.max_elements, in: b.in }, { a: 'read', mode: 'text', max: 1200 }] });
+  look.results.shift();
+  const els = (look.results[0]?.r?.elements || []).filter((e) => b.disabled ? true : !e.dis);
+  if (!els.length) return { ok: false, error: 'no interactive elements on this page' };
+
+  const criteria = { none: 'None of these is what was asked for.' };
+  for (const e of els) criteria[e.ref] = agent.label(e);
+  const st = `PAGE: ${look.results[0]?.r?.title || ''} — ${look.url}\n\nWHAT THE USER IS LOOKING FOR: ${b.want}\n\nPAGE TEXT:\n${(look.results[1]?.r?.text || '').slice(0, 1200)}\n\nELEMENTS:\n` +
+    els.map((e) => `  ${e.ref}  ${agent.label(e)}`).join('\n');
+  const out = await askSeeing(b, st, {
+    target: { type: 'choice', instructions: `Which element is "${b.want}"? Pick the single best match.`, criteria }
+  }, {}, (o) => { const x = jev.read(o.answers.target); return !x.value || x.value === 'none' || x.confidence < CFG.jev.min_confidence; }, b.want);
+  const a = jev.read(out.answers.target);
+  if (!a.value || a.value === 'none') return { ok: false, error: `jev found nothing matching${out.saw ? ', even with a screenshot' : ''}`, confidence: a.confidence, ms: out.ms, saw: out.saw };
+
+  const el = els.find((e) => e.ref === a.value);
+  let sel;
+  if (b.sel !== false) {
+    try { sel = (await runBatch({ tab: b.tab ?? 'active', memory: false, actions: [{ a: 'path', target: `ref=${a.value}` }] })).results[0]?.r; } catch {}
+  }
+  return {
+    ok: true, ref: a.value, element: el, label: el && agent.label(el),
+    sel: sel?.sel || sel?.css, css: sel?.css,
+    confidence: a.confidence, alternatives: (a.ranked || []).filter((x) => x.label !== a.value).slice(0, 3),
+    ms: out.ms, model: out.model, saw: out.saw
+  };
+}
+
+// ── jev settles what a selector cannot ───────────────────────────────────
+// A target that matched several live elements used to act on the first one in
+// the document. A page of posts has an enabled "Comment" button on every post
+// plus one in the box being typed in, and the first is the wrong one: an agent
+// typed its comment, clicked text=Comment, and reopened a different post's box.
+// Now the matches, each with the item it sits in and whether it shares a box
+// with the unsent text, go to jev, which picks one; the action runs on that.
+const ELEMENT_ACTS = new Set(['click', 'dblclick', 'rclick', 'hover', 'type', 'select', 'check', 'uncheck', 'focus', 'clear', 'setval', 'send']);
+const FIELD_ACTS = new Set(['type', 'clear', 'setval', 'send']);
+const OBSERVERS = new Set(['info', 'elements', 'wait', 'read', 'tabs', 'exists', 'box', 'drafts', 'items', 'path', 'matches']);
+// Text in the wrong box lands under someone else's post and cannot be taken
+// back, so for typing jev has to be surer than for a click.
+const FIELD_CONFIDENCE = 0.8;
+
+const wantOf = (t) => (typeof t === 'string'
+  ? t.replace(/^(text|label|placeholder|role|name)=/, '')
+  : [t.sel, t.has && `containing "${t.has}"`, t.near && `near ${t.near}`].filter(Boolean).join(' '));
+
+// Only the first acting step of a batch can be settled up front: everything
+// before it merely looks, so the page it is resolved against is the page it
+// will run against. Returns what was decided, or null when there was nothing
+// to decide.
+async function choose(b) {
+  if (b.pick === false || CFG.jev.enabled === false || !jev.ready(CFG.jev) || !connected() || !Array.isArray(b.actions)) return null;
+  const i = b.actions.findIndex((x) => !OBSERVERS.has(x.a));
+  const a = b.actions[i];
+  if (!a || !ELEMENT_ACTS.has(a.a) || !a.target || a.pick === false) return null;
+  if (typeof a.target === 'string' && a.target.startsWith('ref=')) return null;
+  if (typeof a.target === 'object' && typeof a.target.nth === 'number') return null;
+  const t0 = Date.now();
+  let r = null;
+  try {
+    const m = (await runBatch({ tab: b.tab ?? 'active', memory: false, stopOnError: false,
+      actions: [{ a: 'matches', target: a.target, in: a.in, timeout: 600 }] })).results[0];
+    if (m?.ok) r = m.r;
+  } catch {}
+  if (!r) return null;
+  const field = FIELD_ACTS.has(a.a);
+  const pool = (r.items || []).filter((e) => !e.dis && (!field || e.field));
+  if (pool.length < 2) return null;
+
+  const want = wantOf(a.target);
+  // The candidates in the tightest box with the unsent text, the ones after
+  // it if that still leaves several. Marked only when that narrows the pool.
+  const boxed = pool.filter((e) => e.near);
+  let next = [];
+  if (boxed.length) {
+    const min = Math.min(...boxed.map((e) => e.near.size));
+    next = boxed.filter((e) => e.near.size === min);
+    if (next.some((e) => e.near.after)) next = next.filter((e) => e.near.after);
+    if (next.length === pool.length) next = [];
+  }
+  const marked = new Set(next.map((e) => e.ref));
+  const typed = (r.drafts || []).map((d) => `"${d.text}" in "${d.label}"`).join('; ');
+  const st = [
+    `PAGE: ${r.title || ''} — ${r.url || ''}`,
+    `COMMAND: ${a.a} "${want}"${a.text ? `, typing: "${String(a.text).slice(0, 300)}"` : ''}${a.value ? `, choosing: "${a.value}"` : ''}`,
+    `${pool.length} elements on the page match "${want}". The command is meant for exactly one of them.`,
+    typed ? `TYPED INTO THE PAGE BUT NOT YET SENT: ${typed}` : 'NOTHING IS TYPED INTO THE PAGE YET.',
+    '',
+    'THE MATCHES:',
+    ...pool.map((e) => `  ${e.ref}  ${agent.label(e)}${e.ctx ? ` — inside: "${e.ctx}"` : ''}${marked.has(e.ref) ? ' [RIGHT AFTER THE TEXT BOX HOLDING THE UNSENT TEXT — this is its send button]' : ''}`)
+  ].join('\n');
+  const criteria = {};
+  for (const e of pool) criteria[e.ref] = `${agent.label(e)}${e.ctx ? ` — inside: "${e.ctx.slice(0, 100)}"` : ''}${marked.has(e.ref) ? ' [send button of the unsent text]' : ''}`;
+  const instructions = `Which one of the matches is the command "${a.a} ${want}" meant for? ` + (field
+    ? 'Choose the text box the text belongs in: the post, reply or form it answers.'
+    : 'If text was typed but not sent, the command is sending it: choose the button marked as the send button of the unsent text, not a button that opens a new comment box. Otherwise choose the one in the main content the command most plausibly means.');
+  let out;
+  try { out = await jev.ask(st, { target: { type: 'choice', instructions, criteria } }, CFG.jev); } catch { return null; }
+  const x = jev.read(out.answers.target);
+  const decided = { i, a: a.a, of: pool.length, ref: x.value, confidence: x.confidence, ms: Date.now() - t0 };
+  const floor = field ? Math.max(FIELD_CONFIDENCE, CFG.jev.min_confidence) : CFG.jev.min_confidence;
+  if (!pool.some((e) => e.ref === x.value) || x.confidence < floor) {
+    // jev not sure, but exactly one button sits right after the unsent text:
+    // that beats the first match in the document, which is what used to win.
+    if (!field && marked.size === 1) {
+      const ref = [...marked][0];
+      for (const y of b.actions.slice(i)) if (JSON.stringify(y.target) === JSON.stringify(a.target) && y.in === a.in) y.target = `ref=${ref}`;
+      return { ...decided, ref, by: 'layout', label: agent.label(pool.find((e) => e.ref === ref)) };
+    }
+    // Otherwise leave the action to its old rule, and say jev's lean.
+    return { ...decided, unsure: true };
+  }
+  // A later step aimed at the same thing (type, then send from that box)
+  // follows the same choice.
+  const was = JSON.stringify(a.target);
+  for (const y of b.actions.slice(i)) if (JSON.stringify(y.target) === was && y.in === a.in) y.target = `ref=${x.value}`;
+  decided.label = agent.label(pool.find((e) => e.ref === x.value));
+  return decided;
+}
+
+function mark(out, d) {
+  const r = out.results?.[d.i];
+  if (!r || r.a !== d.a) return;
+  const info = { by: d.by || 'jev', of: d.of, ref: d.ref, confidence: d.confidence, ms: d.ms, ...(d.unsure ? { unsure: true } : {}) };
+  if (r.ok && r.r && typeof r.r === 'object') r.r.picked = info;
+  else r.picked = info;
+}
+
+// A target that matched nothing: ask jev what on the page it most likely
+// meant, and hand that back with the error. It is never acted on — the
+// caller named something else, and a guess is theirs to take.
+async function suggest(b, out) {
+  if (b.pick === false || CFG.jev.enabled === false || !jev.ready(CFG.jev) || !Array.isArray(b.actions)) return;
+  const k = (out.results || []).findIndex((r, j) => !r.ok && ELEMENT_ACTS.has(b.actions[j]?.a));
+  const r = out.results?.[k], a = b.actions[k];
+  if (!r || !a || !a.target || !/^not found: /.test(String(r.error))) return;
+  try {
+    const want = wantOf(a.target);
+    const p = await pickOne({ tab: out.tab, in: a.in, want: FIELD_ACTS.has(a.a) ? `the text box "${want}"` : want, see: false, sel: false });
+    if (p.ok && p.confidence >= CFG.jev.min_confidence) r.suggest = { ref: p.ref, label: p.label, confidence: p.confidence, ms: p.ms };
+  } catch {}
+}
+
+// A caller's batch: runBatch, with jev settling the one guess it would
+// otherwise make, and naming the likely element when a target matched nothing.
+async function act(b) {
+  const d = await choose(b);
+  const out = await runBatch(b);
+  if (d) mark(out, d);
+  if (!out.ok) await suggest(b, out);
+  return out;
 }
 
 // ── each: one action per list item ───────────────────────────────────────
@@ -596,7 +833,7 @@ async function each(b, emit) {
     }
     if (!b.do || b.dry) { emit({ ...row, dry: !!b.do || undefined, ms: Date.now() - r0 }); if (!b.do) did++; continue; }
 
-    const out = await runBatch({ tab, stopOnError: true, memory: false, actions: fillIn(b.do, vars) });
+    const out = await act({ tab, stopOnError: true, memory: false, pick: b.pick, actions: fillIn(b.do, vars) });
     const bad = out.results.find((x) => !x.ok);
     if (bad) { failed++; emit({ ...row, error: `${bad.a}: ${bad.error}`, ms: Date.now() - r0 }); if (b.stopOnError !== false) return { ok: false, rows, did, skipped, failed, stopped: 'error', ms: Date.now() - t0 }; continue; }
     did++;
@@ -673,7 +910,7 @@ async function runBatch(b) {
     recipe = { host: x.host, name: b.recipe };
   }
   if (!actions || !actions.length) throw new HttpError(400, 'no actions');
-  if (!ext && !(await waitForExt(b.wait ?? 10000))) {
+  if (!connected() && !(await waitForExt(b.wait ?? 10000))) {
     throw new HttpError(503, 'extension not connected — load extension/ at chrome://extensions, or open any tab to wake it');
   }
 
@@ -742,19 +979,150 @@ async function unsent(actions, out) {
   });
   const p = PENDING.get(out.tab);
   if (!p || Date.now() - p.at > 5 * 60000) { PENDING.delete(out.tab); return; }
-  const sent = rs.some((r, i) => r.ok && i > typedAt && actions[i] && (actions[i].a === 'click' || actions[i].a === 'send' || (actions[i].a === 'press' && /enter/i.test([].concat(actions[i].keys || actions[i].key).join(' '))))) ||
+  // Only a click on something that reads like a send button counts. Clicking
+  // "Add flair and tags" or "View all flairs" with a post typed in the box is
+  // not a failed send, and warning about it — after 2s of re-checking — made
+  // the Reddit run doubt clicks that had worked.
+  const sendish = (r, a) => a.a !== 'click' || (/\b(post|send|comment|reply|submit|publish|share|tweet|update|save)\b/i.test(`${(r.r && r.r.name) || ''} ${typeof a.target === 'string' ? a.target : ''}`) && !/\b(field|box|input|body|text\s*area)\b/i.test((r.r && r.r.name) || ''));
+  const sent = rs.some((r, i) => r.ok && i > typedAt && actions[i] && sendish(r, actions[i]) && (actions[i].a === 'click' || actions[i].a === 'send' || (actions[i].a === 'press' && /enter/i.test([].concat(actions[i].keys || actions[i].key).join(' '))))) ||
     rs.some((r, i) => r.ok && actions[i] && actions[i].a === 'type' && actions[i].enter);
   if (!sent) return;
   // A real submit clears the box, sometimes only after a network round trip.
   for (let tries = 0; tries < 5; tries++) {
     if (tries) await new Promise((ok) => setTimeout(ok, 500));
-    const d = await call({ t: 'run', tab: out.tab, actions: [{ a: 'drafts' }], timeout: 3000, stopOnError: true, speed: 'instant', trusted: false }, 6000);
+    const d = await call({ t: 'run', tab: out.tab, actions: [{ a: 'drafts', texts: [p.text] }], timeout: 3000, stopOnError: true, speed: 'instant', trusted: false }, 6000);
     const still = (d.results?.[0]?.r?.drafts || []).find((x) => squash(x.text).includes(p.text));
     if (!still) { out.sent = p.label || 'the text box'; PENDING.delete(out.tab); return; }
     if (tries === 4) {
       (out.warnings = out.warnings || []).push(`the text you typed is still in "${still.label}" (${still.ref}) after that click — it was NOT sent. The click hit something else; find the real send button inside the same item (bx els --in <item ref>): it may say Comment, Send or Reply rather than Post.`);
     }
   }
+}
+
+// ── jev keys and settings ────────────────────────────────────────────────
+// Kept by the bridge, not the browser: every browser and profile with bx
+// connected reads and edits this one list, from the CLI or its toolbar popup.
+function jevView() {
+  const st = jev.stats;
+  return {
+    enabled: CFG.jev.enabled !== false,
+    ready: jev.ready(CFG.jev),
+    ...jev.describe(CFG.jev),
+    sees: jev.canSee(CFG.jev),
+    min_confidence: CFG.jev.min_confidence,
+    steps: CFG.jev.steps,
+    samples: CFG.jev.samples,
+    max_steps: CFG.jev.max_steps,
+    see: CFG.jev.see || 'auto',
+    parallel: CFG.jev.parallel,
+    usage: { calls: st.calls, failed: st.fails, avg_ms: st.calls ? Math.round(st.ms / st.calls) : 0, input_tokens: st.in, peak: st.peak, ...jev.busy() }
+  };
+}
+
+const PROVIDER_MODES = ['auto', 'typesafe', 'codiv'];
+
+function jevPatch(patch) {
+  if ('provider' in patch && !PROVIDER_MODES.includes(patch.provider)) throw new HttpError(400, `provider is one of ${PROVIDER_MODES.join(', ')}`);
+  for (const k of ['enabled', 'provider', 'timeout', 'steps', 'samples', 'min_confidence', 'max_steps', 'max_elements', 'see', 'sift_batch', 'parallel']) {
+    if (k in patch) CFG.jev[k] = patch[k];
+  }
+  // A model or base belongs to one provider: the one named, the one its name
+  // says (openjev-… is codiv's, jev-1.13.0 TypeSafe's), else the one text goes to.
+  for (const p of Object.keys(jev.PROVIDERS)) {
+    if (patch[p] && typeof patch[p] === 'object') CFG.jev[p] = { ...(CFG.jev[p] || {}), ...pickKeys(patch[p], ['base', 'model']) };
+  }
+  if (patch.model) {
+    const p = jev.modelProvider(patch.model) || jev.route(CFG.jev, false)[0] || 'codiv';
+    CFG.jev[p] = { ...(CFG.jev[p] || {}), model: patch.model };
+  }
+  if (patch.base) {
+    const p = /typesafe/.test(patch.base) ? 'typesafe' : 'codiv';
+    CFG.jev[p] = { ...(CFG.jev[p] || {}), base: patch.base };
+  }
+  saveConfig(CFG);
+  return jevView();
+}
+const pickKeys = (o, ks) => Object.fromEntries(ks.filter((k) => typeof o[k] === 'string' && o[k]).map((k) => [k, o[k]]));
+
+// A key is tried once before it is saved, so a typo or a revoked key is
+// caught here rather than on the first real decision.
+async function keyAdd(b) {
+  const key = String(b.key || '').trim();
+  if (!key || /\s/.test(key) || key.length < 16) throw new HttpError(400, 'that does not look like an API key');
+  const provider = jev.PROVIDERS[b.provider] ? b.provider : jev.providerOf(key);
+  if (!provider) throw new HttpError(400, 'cannot tell whose key this is (TypeSafe keys start apikey_, codiv keys sk-) — pass provider typesafe or codiv');
+  const have = CFG.jev.keys.find((k) => k.key === key);
+  if (have) return { ok: true, existing: true, id: have.id, provider: have.provider, label: have.label, jev: jevView() };
+  let test = null;
+  if (b.test !== false) {
+    test = await jev.test(key, provider, CFG.jev);
+    if (!test.ok && test.refused) throw new HttpError(400, `${provider} refused this key (${test.status}) — check it was copied whole`);
+  }
+  const n = CFG.jev.keys.filter((k) => k.provider === provider).length;
+  const label = String(b.label || '').trim().slice(0, 40) || `${provider} ${n + 1}`;
+  const id = keyId();
+  CFG.jev.keys.push({ id, provider, label, key, added: Date.now() });
+  if (b.enable !== false) CFG.jev.enabled = true;
+  saveConfig(CFG);
+  return { ok: true, id, provider, label, test, jev: jevView() };
+}
+
+// By id, by label, or by the last four characters the masked key shows.
+function keyRemove(ref) {
+  const r = String(ref || '').trim();
+  if (!r) throw new HttpError(400, 'which key? pass its id, label or last 4 characters');
+  if (r.startsWith('env:')) throw new HttpError(400, `that key comes from the environment — unset ${r.slice(4)} where the bridge starts`);
+  const hits = CFG.jev.keys.filter((k) => k.id === r || k.label === r || (r.length >= 4 && k.key.endsWith(r)));
+  if (!hits.length) throw new HttpError(404, `no key matches "${r}" — bx jev keys lists them`);
+  if (hits.length > 1) throw new HttpError(400, `"${r}" matches ${hits.length} keys — use the id from bx jev keys`);
+  CFG.jev.keys = CFG.jev.keys.filter((k) => k !== hits[0]);
+  saveConfig(CFG);
+  return { ok: true, removed: { id: hits[0].id, provider: hits[0].provider, label: hits[0].label }, jev: jevView() };
+}
+
+// ── which browser is which ──────────────────────────────────────────────
+// Chrome, Brave, Edge and the rest all run bx the same way; the brand list a
+// worker reports is the only thing that tells them apart.
+function browserName(m) {
+  const brands = (Array.isArray(m && m.chrome) ? m.chrome : []).map((b) => b.brand || '');
+  const named = brands.find((b) => b && !/not.?a.?brand|chromium/i.test(b));
+  if (named) return named.replace(/^Google /, '').replace(/^Microsoft /, '');
+  const ua = String((m && m.ua) || '');
+  if (/Edg\//.test(ua)) return 'Edge';
+  if (/OPR\//.test(ua)) return 'Opera';
+  return brands.length ? 'Chromium' : ua ? 'Chrome' : null;
+}
+
+// Extensions that dialled in but are not on the allowed list, so `bx status`
+// can say how to let one in instead of it failing silently.
+const refused = new Map();      // extension id -> {at, ua, tries}
+
+function extView(me) {
+  const p = primary();
+  return {
+    allowed: CFG.extension_ids,
+    refused: [...refused.entries()].map(([id, r]) => ({ id, at: r.at, tries: r.tries, browser: browserName({ ua: r.ua }) })),
+    browsers: [...exts.entries()].map(([ws, x]) => ({
+      iid: x.iid ? x.iid.slice(0, 8) : null, browser: browserName(x), ext: x.ext, primary: ws === p, you: ws === me,
+      since: x.since, windows: x.windows, tabs: x.tabs
+    }))
+  };
+}
+
+function extAllow(id) {
+  if (!/^[a-p]{32}$/.test(String(id || ''))) throw new HttpError(400, 'an extension id is 32 letters a–p — bx status shows the refused one');
+  if (!CFG.extension_ids.includes(id)) CFG.extension_ids.push(id);
+  refused.delete(id);
+  saveConfig(CFG);
+  return { ok: true, allowed: CFG.extension_ids };
+}
+
+function extForget(id) {
+  if (!CFG.extension_ids.includes(id)) throw new HttpError(404, `${id} is not on the allowed list`);
+  CFG.extension_ids = CFG.extension_ids.filter((x) => x !== id);
+  saveConfig(CFG);
+  for (const [ws, m] of exts) if (m.ext === id) { try { ws.close(1008); } catch {} }
+  return { ok: true, allowed: CFG.extension_ids };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -766,26 +1134,35 @@ const server = http.createServer(async (req, res) => {
 
   // /health is the only unauthenticated route — used by the CLI to see if the
   // bridge is up before it bothers reading the token.
-  if (route === '/health') return send(res, 200, { ok: true, up: true, ext: !!ext });
+  if (route === '/health') return send(res, 200, { ok: true, up: true, ext: connected() });
 
   const tok = req.headers['x-bx-token'] || url.searchParams.get('token');
   if (tok !== CFG.token) return send(res, 401, { ok: false, error: 'bad token' });
 
   try {
     if (route === '/status' && req.method === 'GET') {
+      const p = primary();
+      const m = p ? exts.get(p) : null;
       return send(res, 200, {
         ok: true,
-        connected: !!ext,
-        extension: extMeta,
+        connected: connected(),
+        extension: { id: CFG.extension_ids[0] || null, ids: CFG.extension_ids, since: m ? m.since : 0, ua: m ? m.ua : null },
+        refused: extView().refused,
+        // Every browser and profile with bx loaded, the one commands go to first.
+        instances: [...exts.entries()].map(([ws, x]) => ({
+          iid: x.iid ? x.iid.slice(0, 8) : null, browser: browserName(x), primary: ws === p, since: x.since,
+          windows: x.windows, tabs: x.tabs, used: x.used || null, focusedAt: x.focusedAt || null,
+          own: x.own, bxWindow: x.bxWindow
+        })),
         port: CFG.port,
         speed: CFG.speed,
         trusted: CFG.trusted,
         timeout: CFG.timeout,
         pending: pending.size,
-        beat: lastBeat ? Date.now() - lastBeat : null,
+        beat: m ? Date.now() - m.beat : null,
         pid: process.pid,
         home: HOME,
-        jev: { enabled: CFG.jev.enabled !== false, ready: jev.ready(CFG.jev), model: CFG.jev.model }
+        jev: (() => { const d = jev.describe(CFG.jev); return { enabled: CFG.jev.enabled !== false, ready: jev.ready(CFG.jev), provider: d.provider, route: d.route, keys: d.keys.length, models: { typesafe: d.providers.typesafe.model, codiv: d.providers.codiv.model } }; })()
       });
     }
 
@@ -802,14 +1179,13 @@ const server = http.createServer(async (req, res) => {
           if (k in patch) CFG[k] = patch[k];
         }
         saveConfig(CFG);
-        if (ext) ext.send(JSON.stringify({ t: 'cfg', cfg: pick(CFG) }));
+        broadcast(JSON.stringify({ t: 'cfg', cfg: pick(CFG) }));
         return send(res, 200, { ok: true, config: { ...CFG, token: '••••' } });
       }
     }
 
     if (route === '/do' && req.method === 'POST') {
-      const out = await runBatch(await body(req));
-      return send(res, 200, out);
+      return send(res, 200, await act(await body(req)));
     }
 
     // ── memory ───────────────────────────────────────────────────────────
@@ -847,10 +1223,12 @@ const server = http.createServer(async (req, res) => {
       return send(res, r.error ? 404 : 200, r.error ? { ok: false, ...r } : { ok: true, ...r });
     }
 
+    // Every profile runs the same code off disk, so every one of them reloads.
     if (route === '/reload' && req.method === 'POST') {
-      if (!ext) return send(res, 503, { ok: false, error: 'extension not connected' });
-      ext.send('{"t":"reload"}');
-      return send(res, 200, { ok: true, reloading: true });
+      if (!connected()) return send(res, 503, { ok: false, error: 'extension not connected' });
+      const n = exts.size;
+      broadcast('{"t":"reload"}');
+      return send(res, 200, { ok: true, reloading: n });
     }
 
     if (route === '/shutdown' && req.method === 'POST') {
@@ -860,34 +1238,23 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ── jev: the fast brain ──────────────────────────────────────────────
-    if (route === '/jev' && req.method === 'GET') {
-      const k = jev.key(CFG.jev);
-      const st = jev.stats;
-      return send(res, 200, {
-        ok: true,
-        enabled: CFG.jev.enabled !== false,
-        ready: !!k,
-        key: k ? k.slice(0, 8) + '…' + k.slice(-4) : null,
-        source: process.env.CODIV_API_KEY ? 'env CODIV_API_KEY' : process.env.TYPESAFE_API_KEY ? 'env TYPESAFE_API_KEY' : CFG.jev.api_key ? 'config' : null,
-        model: CFG.jev.model,
-        base: CFG.jev.base,
-        min_confidence: CFG.jev.min_confidence,
-        steps: CFG.jev.steps,
-        samples: CFG.jev.samples,
-        max_steps: CFG.jev.max_steps,
-        see: CFG.jev.see || 'auto',
-        usage: { calls: st.calls, failed: st.fails, avg_ms: st.calls ? Math.round(st.ms / st.calls) : 0, input_tokens: st.in }
-      });
-    }
+    if (route === '/jev' && req.method === 'GET') return send(res, 200, { ok: true, ...jevView() });
 
     if (route === '/jev' && req.method === 'POST') {
       const patch = await body(req);
-      for (const k of ['enabled', 'api_key', 'base', 'model', 'timeout', 'steps', 'samples', 'min_confidence', 'max_steps', 'max_elements', 'see', 'sift_batch']) {
-        if (k in patch) CFG.jev[k] = patch[k];
-      }
-      saveConfig(CFG);
-      return send(res, 200, { ok: true, jev: { ...CFG.jev, api_key: CFG.jev.api_key ? '••••' : null } });
+      // `bx jev key` from before there were several keys.
+      if (patch.api_key) await keyAdd({ key: patch.api_key, test: false });
+      return send(res, 200, { ok: true, jev: jevPatch(patch) });
     }
+
+    if (route === '/jev/keys' && req.method === 'GET') return send(res, 200, { ok: true, ...jevView() });
+    if (route === '/jev/keys' && req.method === 'POST') return send(res, 200, await keyAdd(await body(req)));
+    if (route === '/jev/keys/remove' && req.method === 'POST') return send(res, 200, keyRemove((await body(req)).id));
+
+    // ── extensions: which may connect, which are ────────────────────────
+    if (route === '/ext' && req.method === 'GET') return send(res, 200, { ok: true, ...extView() });
+    if (route === '/ext/allow' && req.method === 'POST') return send(res, 200, extAllow((await body(req)).id));
+    if (route === '/ext/forget' && req.method === 'POST') return send(res, 200, extForget((await body(req)).id));
 
     // Raw passthrough. Any state, any questions — useful for anything on a
     // page that bx itself has no opinion about.
@@ -901,10 +1268,9 @@ const server = http.createServer(async (req, res) => {
         const r = look.results[0]?.r || {};
         st = `URL: ${look.url}\nTITLE: ${r.title || ''}\n\n${r.text || ''}` + (b.state ? `\n\n${b.state}` : '');
       }
-      const img = b.see === true ? await snap(b.tab) : null;
+      const img = b.see === true && jev.canSee(CFG.jev) ? await snap(b.tab) : null;
       const images = b.images || (img ? [img] : undefined);
-      const out = await jev.ask(st, b.questions, CFG.jev, { model: b.model, steps: b.steps, samples: b.samples, think: b.think, sequential: b.sequential, images });
-      out.saw = !!(images && images.length);
+      const out = await jev.ask(st, b.questions, CFG.jev, { model: b.model, provider: b.provider, steps: b.steps, samples: b.samples, think: b.think, sequential: b.sequential, images });
       return send(res, 200, { ok: true, ...out });
     }
 
@@ -913,33 +1279,7 @@ const server = http.createServer(async (req, res) => {
     if (route === '/jev/pick' && req.method === 'POST') {
       const b = await body(req);
       if (!b.want) throw new HttpError(400, 'pick needs a description of what to find');
-      const look = await runBatch({ tab: b.tab ?? 'active', memory: false, stopOnError: false,
-        actions: [{ a: 'wait', settle: true, timeout: 3000 }, { a: 'elements', max: b.max || CFG.jev.max_elements }, { a: 'read', mode: 'text', max: 1200 }] });
-      look.results.shift();
-      const els = (look.results[0]?.r?.elements || []).filter((e) => b.disabled ? true : !e.dis);
-      if (!els.length) return send(res, 200, { ok: false, error: 'no interactive elements on this page' });
-
-      const criteria = { none: 'None of these is what was asked for.' };
-      for (const e of els) criteria[e.ref] = agent.label(e);
-      const st = `PAGE: ${look.results[0]?.r?.title || ''} — ${look.url}\n\nWHAT THE USER IS LOOKING FOR: ${b.want}\n\nPAGE TEXT:\n${(look.results[1]?.r?.text || '').slice(0, 1200)}\n\nELEMENTS:\n` +
-        els.map((e) => `  ${e.ref}  ${agent.label(e)}`).join('\n');
-      const out = await askSeeing(b, st, {
-        target: { type: 'choice', instructions: `Which element is "${b.want}"? Pick the single best match.`, criteria }
-      }, {}, (o) => { const x = jev.read(o.answers.target); return !x.value || x.value === 'none' || x.confidence < CFG.jev.min_confidence; }, b.want);
-      const a = jev.read(out.answers.target);
-      if (!a.value || a.value === 'none') return send(res, 200, { ok: false, error: `jev found nothing matching${out.saw ? ', even with a screenshot' : ''}`, confidence: a.confidence, ms: out.ms, saw: out.saw });
-
-      const el = els.find((e) => e.ref === a.value);
-      let sel;
-      if (b.sel !== false) {
-        try { sel = (await runBatch({ tab: b.tab ?? 'active', memory: false, actions: [{ a: 'path', target: `ref=${a.value}` }] })).results[0]?.r; } catch {}
-      }
-      return send(res, 200, {
-        ok: true, ref: a.value, element: el, label: el && agent.label(el),
-        sel: sel?.sel || sel?.css, css: sel?.css,
-        confidence: a.confidence, alternatives: (a.ranked || []).filter((x) => x.label !== a.value).slice(0, 3),
-        ms: out.ms, model: out.model, saw: out.saw
-      });
+      return send(res, 200, await pickOne(b));
     }
 
     // Yes/no about the page in front of us. "Am I logged in", "did that save",
@@ -999,7 +1339,7 @@ const server = http.createServer(async (req, res) => {
         ok: true, criterion: b.criterion, pages: pages.length || 1, ...(unjudged.length ? { unjudged: `${unjudged.length} items: ${unjudged[0].unjudged}` } : {}),
         url: pages[0]?.url || b.url, title: pages[0]?.title || b.title,
         n: judged.length, kept: kept.length,
-        items: b.all ? judged : kept, ms: Date.now() - t0, model: CFG.jev.model, saw: judged.some((x) => x.saw)
+        items: (b.all ? judged : kept).map(({ model, ...x }) => x), ms: Date.now() - t0, model: judged.find((x) => x.model)?.model, saw: judged.some((x) => x.saw)
       });
     }
 
@@ -1075,7 +1415,7 @@ const server = http.createServer(async (req, res) => {
 // round trip; otherwise ask the live tab.
 async function hostNow() {
   if (lastHost) return lastHost;
-  if (!ext) return null;
+  if (!connected()) return null;
   try {
     const out = await call({ t: 'run', tab: 'active', actions: [{ a: 'info' }], timeout: 3000, stopOnError: true, speed: 'instant', trusted: false }, 6000);
     const h = mem.hostOf(out && out.url);
@@ -1093,30 +1433,49 @@ server.on('upgrade', (req, sock, head) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (url.pathname !== '/ext') { try { sock.destroy(); } catch {} return; }
 
+  const ext = (/^chrome-extension:\/\/([a-p]{32})$/.exec(String(req.headers.origin || '')) || [])[1] || null;
   const ws = handleUpgrade(req, sock, head, (r) => {
-    const origin = String(r.headers.origin || '');
-    const m = /^chrome-extension:\/\/([a-p]{32})$/.exec(origin);
-    if (!m) return false;
-    // Trust-on-first-use: the first extension to connect owns this bridge.
-    if (!CFG.extension_id) { CFG.extension_id = m[1]; saveConfig(CFG); }
-    return CFG.extension_id === m[1];
+    if (!ext) return false;
+    // Trust-on-first-use: the first extension to connect is allowed. An
+    // unpacked extension's id comes from its folder, so bx loaded from the
+    // same folder has the same id in every Chromium browser; loaded from a
+    // copy elsewhere it is a different extension and has to be allowed.
+    if (!CFG.extension_ids.length) { CFG.extension_ids.push(ext); saveConfig(CFG); }
+    if (CFG.extension_ids.includes(ext)) return true;
+    const was = refused.get(ext);
+    if (!was) note('ext', { event: 'refused', ext, hint: `bx ext allow ${ext}` });
+    refused.set(ext, { at: Date.now(), ua: String(r.headers['user-agent'] || ''), tries: (was ? was.tries : 0) + 1 });
+    return false;
   });
   if (!ws) return;
 
-  if (ext) ext.close(1000);
-  ext = ws;
-  lastBeat = Date.now();
-  extMeta = { id: CFG.extension_id, since: Date.now(), ua: null };
-  note('ext', { event: 'connected' });
+  // The same profile dialling in again means its worker restarted and the old
+  // socket is dead or about to be: replace it. Another profile's socket stays.
+  // An extension too old to send an id counts as one profile, as it always did.
+  const iid = url.searchParams.get('iid') || null;
+  for (const [old, m] of exts) {
+    if (m.iid === iid) { exts.delete(old); try { old.close(1000); } catch {} }
+  }
+  const meta = { iid, ext, since: Date.now(), beat: Date.now(), ua: null };
+  exts.set(ws, meta);
+  note('ext', { event: 'connected', iid: iid && iid.slice(0, 8), profiles: exts.size });
   ws.send(JSON.stringify({ t: 'hello', cfg: pick(CFG) }));
 
   ws.on('message', (raw) => {
     let m;
     try { m = JSON.parse(raw); } catch { return; }
-    lastBeat = Date.now();
+    meta.beat = Date.now();
     if (m.t === 'ka') return;
-    if (m.t === 'hi') { extMeta.ua = m.ua; extMeta.chrome = m.chrome; return; }
+    if (m.t === 'hi') { meta.ua = m.ua; meta.chrome = m.chrome; return; }
+    if (m.t === 'st') {
+      Object.assign(meta, { windows: m.windows, tabs: m.tabs, used: m.used, own: m.own, bxWindow: m.bxWindow });
+      if (m.focused) meta.focusedAt = Date.now();
+      return;
+    }
     if (m.t === 'ev') { note('ev', m.d || {}); return; }
+    // The popup's requests, relayed by the worker. The socket was admitted
+    // by extension id, so these need no token; keys only ever go back masked.
+    if (m.t === 'rq') { request(ws, m); return; }
     const p = pending.get(m.id);
     if (!p) return;
     clearTimeout(p.timer);
@@ -1126,24 +1485,48 @@ server.on('upgrade', (req, sock, head) => {
   });
 
   ws.on('close', () => {
-    if (ext === ws) { ext = null; extMeta = { id: CFG.extension_id, since: 0, ua: null }; }
-    note('ext', { event: 'disconnected' });
-    for (const [id, p] of pending) { clearTimeout(p.timer); p.reject(new Error('extension disconnected')); pending.delete(id); }
+    exts.delete(ws);
+    for (const [t, w] of owner) if (w === ws) owner.delete(t);
+    note('ext', { event: 'disconnected', iid: iid && iid.slice(0, 8), profiles: exts.size });
+    for (const [id, p] of pending) {
+      if (p.ws !== ws) continue;
+      clearTimeout(p.timer); p.reject(new Error('extension disconnected')); pending.delete(id);
+    }
   });
 });
+
+async function request(ws, m) {
+  const a = m.args || {};
+  let r;
+  try {
+    if (m.op === 'jev') r = { ok: true, jev: jevView(), ext: extView(ws) };
+    else if (m.op === 'jev.set') {
+      // Only what the popup offers: which provider, and jev on or off.
+      const patch = {};
+      if ('provider' in a) patch.provider = a.provider;
+      if ('enabled' in a) patch.enabled = !!a.enabled;
+      r = { ok: true, jev: jevPatch(patch) };
+    }
+    else if (m.op === 'jev.add') r = await keyAdd({ key: a.key, label: a.label, provider: a.provider });
+    else if (m.op === 'jev.rm') r = keyRemove(a.id);
+    else r = { ok: false, error: `unknown request ${m.op}` };
+  } catch (e) { r = { ok: false, error: String(e.message || e) }; }
+  try { ws.send(JSON.stringify({ t: 'rs', rid: m.rid, r })); } catch {}
+}
 
 // A service worker killed mid-batch can leave the TCP side half-open, and the
 // caller then sits on the full action budget for nothing. The extension echoes
 // every keepalive, so a missed echo is a dead socket: drop it and fail fast
 // with a real reason instead of a timeout thirty seconds later.
 setInterval(() => {
-  if (!ext) return;
-  if (Date.now() - lastBeat > 26000) {
-    note('ext', { event: 'stale' });
-    try { ext.close(1001); } catch {}
-    return;
+  for (const [ws, m] of exts) {
+    if (Date.now() - m.beat > 26000) {
+      note('ext', { event: 'stale', iid: m.iid && m.iid.slice(0, 8) });
+      try { ws.close(1001); } catch {}
+      continue;
+    }
+    try { ws.send('{"t":"ka"}'); } catch {}
   }
-  ext.send('{"t":"ka"}');
 }, 8000).unref();
 
 server.on('error', (e) => {

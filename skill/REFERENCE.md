@@ -203,13 +203,27 @@ yourself. Output marked 👁 means jev looked. The machine-wide default is
 
 ## jev on and off
 
-jev is on by default and needs a key once:
+jev is on by default and needs a key once. TypeSafe keys (`apikey_…`,
+console.typesafe.ai/keys) read text only and were faster and more accurate;
+codiv keys (`sk-codiv-…`, codiv.ai/dashboard) also read screenshots. Add any
+number of either. Calls take turns across a service's keys and skip one that
+is rate-limited, out of credit or refused.
 
 ```bash
-bx jev key sk-codiv-...      # or set CODIV_API_KEY
-bx jev                       # model, key, confidence floor, what it has cost
+bx jev key                   # asks for the key, hidden; or: … | bx jev key -   (--label NAME)
+bx jev                       # where text and screenshots go, every key and its status
+bx jev keys                  # just the keys
+bx jev rm <label|id>         # remove one
+bx jev use auto              # text → TypeSafe, screenshots → codiv, each falling back (default)
+bx jev use typesafe|codiv    # one service only (screenshots always need codiv)
 bx jev off                   # agent then runs on word-matching alone
 ```
+
+Keys live in the bridge (`~/.bx/config.json`, 0600) and are shared by every
+browser connected to it; the bx toolbar popup manages the same list. Never ask
+the user to paste a key into the chat: point them to `bx jev key` or the popup.
+With no codiv key, `--see` and the automatic screenshot retry are skipped and
+jev answers from the text.
 
 `bx agent --no-jev` runs the identical loop with a local word-overlap brain:
 no network, no key, and noticeably worse — it wanders and gets stuck where jev
@@ -225,20 +239,42 @@ control never wins over a live one, and `aria-disabled="true"` counts as
 disabled, which is how most design systems mark a dead submit button.
 
 Ranking cannot break a tie between two *enabled* elements with the same text,
-so the result says when there was one:
+so jev does. Before the first acting step of a command runs, bx lists every
+live match, each with the text of the post or row it sits in and whether it
+shares a box with text typed but not sent, and jev picks the one meant (about
+a second, only when there is a tie to break):
 
 ```
-ok click        41ms  @ 132,107  · 7 matched
+ok click        44ms  @ 812,640 → "Comment"  · jev chose 1 of 6  92%
+```
+
+That is the send button next to your unsent comment, not the first "Comment"
+on the page. The pick is carried to later steps aimed at the same target
+(`type --send`). For typing, jev must be 80% sure — text in the wrong box
+lands under someone else's post — or bx refuses as before and says which box
+jev leaned to. When jev is unsure about a click, the old rule applies and the
+result says so:
+
+```
+ok click        41ms  @ 132,107  · 7 matched, jev unsure  48% — took the first
   also e2    #post1 > div:nth-of-type(2) > button
-  also e3    #post1 > div:nth-of-type(3) > div > button:nth-of-type(2)
 ```
 
-`n` is how many matched and `alt` lists the runners-up as refs. **Treat
-`N matched` as a warning**: the step reported ok, but on a page with six
-"Comment" buttons the one it clicked may not be the one you meant. Either
-click the ref it handed you, or narrow the target with `has` / `near`. Do not
-reach for `eval` to hand-roll a `querySelectorAll(...).filter(...)` — filtering
-on `.disabled` alone misses `aria-disabled` and picks the wrong button.
+**Treat `jev unsure` and `N matched` as warnings**: click the ref it handed
+you, or narrow the target with `has` / `near` / `--in`. Do not reach for `eval`
+to hand-roll a `querySelectorAll(...).filter(...)` — filtering on `.disabled`
+alone misses `aria-disabled` and picks the wrong button.
+
+A target that matches nothing comes back with jev's closest match, which is
+never clicked for you:
+
+```
+✗ click       8012ms  not found: text=Post
+  ▸ jev closest match on the page: e41 button "Post comment"  91%  → bx click ref=e41
+```
+
+`ref=` and `nth` targets are taken as meant and skip all of this; `--no-jev`
+turns it off for one command.
 
 `inert: true` on a result means the element bx acted on was itself disabled —
 the click dispatched and the page ignored it.
@@ -316,7 +352,14 @@ a cookie banner or modal. Dismiss it and retry.
 
 Work the list in order; do not sit and retry the same command.
 
-1. `bx status` — one line tells you which half is unhappy.
+0. A page in bx's window that never loads its feed, or `bx info` saying
+   `"visible": "hidden"`: the user minimized bx's window, and Chrome pauses
+   pages there. Ask them to restore it; it can sit behind their windows.
+1. `bx status` — one line tells you which half is unhappy. If it warns that
+   the connected Chrome profile has no window open, stop: bx is answering
+   from an idle profile, and the profile the user browses in has a bx that is
+   not connected. Tell the user to reload bx at chrome://extensions in the
+   profile they use. Retrying will not change which profile answers.
 2. `extension not connected`: Chrome tears the extension's worker down when it
    has been idle. It dials back in within a second or two of any browser
    activity, and `/do` already waits 10s for it. If it is still not connected,

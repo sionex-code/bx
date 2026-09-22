@@ -173,7 +173,12 @@ BX.qsa = (sel, deep) => {
       ? `bad selector: ${sel} — ${pw[0]} is Playwright syntax, not CSS. Use text=… or {"sel":"…","has":"…"}`
       : `bad selector: ${sel}`);
   }
-  if (deep !== false && out.length === 0) {
+  // deep === true: always look inside open shadow roots too. The default only
+  // does so when the page itself has no match, which is wrong for sites whose
+  // whole UI is web components: on Reddit's post form the Post, Save Draft and
+  // flair buttons and the flair dialog all live in shadow roots, so the list
+  // showed the footer links and the agent fell back to 60 evals.
+  if (deep === true || BX.forceDeep || (deep !== false && out.length === 0)) {
     for (const r of BX.roots()) { if (r === document) continue; try { out.push(...r.querySelectorAll(sel)); } catch {} }
   }
   return out;
@@ -234,17 +239,18 @@ BX.byText = (want) => {
   };
 
   // 1 — the things a person actually clicks, plus nearby labels and cells.
-  for (const el of BX.qsa(BX.INTERACTIVE + ',label,td,th,li,h1,h2,h3,h4,h5,h6', false)) {
+  for (const el of BX.qsa(BX.INTERACTIVE + ',label,td,th,li,h1,h2,h3,h4,h5,h6', true)) {
     if (cheapHit(el)) consider(el);
   }
 
   // 2 — plain text anywhere else, from one pass over the document's text nodes.
   if (!exact.length) {
-    const root = document.body || document.documentElement;
     const head = want.split(' ')[0];
-    if (root) {
+    let guard = 0;
+    for (const root of [document.body || document.documentElement, ...BX.roots().filter((r) => r !== document)]) {
+      if (!root) continue;
       const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-      let n, guard = 0;
+      let n;
       while ((n = w.nextNode()) && guard++ < 60000) {
         const v = n.nodeValue;
         if (!v || v.length > 4096) continue;
@@ -381,6 +387,13 @@ BX.candidates = (target) => {
 // reports success against the wrong element.
 BX.matches = (target, opt = {}) => {
   let list = BX.candidates(target);
+  // The page may hold a hidden match for the selector (a stray <textarea>) while
+  // the real, visible one sits in a shadow root — Reddit's Title box. Nothing
+  // visible in the light DOM: look inside the shadow roots too.
+  if (!list.some(BX.visible)) {
+    BX.forceDeep = true;
+    try { const deeper = BX.candidates(target); if (deeper.some(BX.visible)) list = deeper; } finally { BX.forceDeep = false; }
+  }
   if (opt.in) {
     const box = BX.candidates(opt.in).find(BX.visible) || BX.candidates(opt.in)[0];
     if (!box) BX.notfound(opt.in);

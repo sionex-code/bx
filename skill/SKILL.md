@@ -6,10 +6,19 @@ description: Drive the user's real, logged-in Chrome from the shell — open pag
 # bx — browser control
 
 If `bx sift`, `bx check`, `bx pick` or `bx agent` say "no jev key", tell the
-user to get one at https://codiv.ai (account → API Console → Keys) and run
-`bx jev key sk-...`. Do not ask them to paste the key into the chat.
+user to get one (TypeSafe at https://console.typesafe.ai/keys, or codiv at
+https://codiv.ai/dashboard) and add it with `bx jev key` or in the bx toolbar
+popup. Do not ask them to paste the key into the chat.
 
 One command per line. Batch aggressively. Do not deliberate between steps.
+
+By default bx works in **its own Chrome window** (a "bx" tab group) and never
+navigates, switches or focuses the user's tabs, so they can keep browsing
+while you work. "The current tab" means bx's tab there (`bx▸` in `bx tabs`).
+To act on the tab the user is looking at, add `--here`, and only when they
+ask for it. The user switches the mode in the bx toolbar popup; `bx status`
+says which one is on. Do not minimize or close bx's window — Chrome pauses
+pages in a minimized window.
 
 ```bash
 bx status                     # is it connected?
@@ -470,6 +479,13 @@ supplies them at replay time. Memory lives in `~/.bx/memory/<host>.json`.
 `has`, `near` and `nth` combine, and `--has` / `--near` / `--nth` are the same
 thing on the plain commands: `bx click button --has Comment --near .ql-editor`.
 
+Several live matches: jev picks the one meant, from the post or row each sits
+in and any text typed but not sent, and the result says `jev chose 1 of 6`.
+`jev unsure` means it fell back to the first match — check, or click the ref.
+A target that matches nothing comes back with jev's closest match as a ref to
+click yourself. `ref=` targets are never second-guessed; `--no-jev` turns
+this off.
+
 Frames and open shadow roots are searched automatically when the main
 document has no match.
 
@@ -488,6 +504,14 @@ document has no match.
 - `covered` on a click means an overlay intercepted it. Dismiss the banner or
   modal and click again.
 - A batch stops at the first failure unless you pass `"stopOnError":false`.
+- Never `cat ~/.bx/config.json`: it holds the user's jev API key and would put
+  it in your transcript. `bx status` and `bx jev` show what you need.
+- Need a link to the user's own project? Take it from the repo you are in
+  (`git remote -v`), don't guess it. A run guessed three wrong GitHub URLs.
+- Sites built from web components (Reddit's post form and flair dialog) keep
+  their buttons inside shadow roots. `bx els`, `text=` targets and CSS targets
+  see into them; do not fall back to `bx eval` digging. If a box is ambiguous
+  bx says which refs match: pick one with `ref=eN`.
 - Quote every URL. zsh treats `(`, `)`, `?` and `*` as glob characters, so
   `bx open https://en.wikipedia.org/wiki/Jal_(band)` fails before bx even
   runs. Write `bx open "https://…/Jal_(band)"`.

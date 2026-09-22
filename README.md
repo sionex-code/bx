@@ -329,45 +329,70 @@ page at once in background tabs and close them afterwards. On sites that
 serve real HTML they first try fetching the page from inside a tab already on
 that site, which needs no tab at all.
 
-jev also sees screenshots. `check` and `pick` add one when the text answer
-is unsure or the question is about looks ("is the button greyed out"), and
-`--see` forces it.
+jev also sees screenshots, through a codiv key (TypeSafe reads text only).
+`check` and `pick` add one when the text answer is unsure or the question is
+about looks ("is the button greyed out"), and `--see` forces it. With no codiv
+key bx does not take the screenshot at all and answers from the text.
 
 ### Get a jev key (2 minutes)
 
 jev is a hosted model, so bx needs an API key. It is separate from your Claude
-or MiniMax key, and you only do this once.
+or MiniMax key. Two services answer the same API, and bx can use either or
+both:
 
-1. Go to **https://codiv.ai** and sign up or log in. (codiv.ai and TypeSafe are
-   the same service. `https://console.typesafe.ai/keys` is the console page
-   the key comes from.)
-2. Open the **API Console** from your account menu, then **Keys**, and create
-   a new key. Copy it now; it starts with `sk-`.
-3. Give it to bx:
+| | TypeSafe | codiv.ai |
+|---|---|---|
+| Model | Jev (`jev-latest`) | OpenJev, an independent open copy of Jev (`openjev-latest`) |
+| Reads | text only | text and screenshots |
+| Speed, accuracy (20 bx tasks, Sep 2026) | ~420ms, 295/295 right | ~980ms, 285/295 right |
+| Free | $5 credit a month, then $0.042 per million input tokens | 100M tokens (a free public experiment) |
+| Keys look like | `apikey_…` | `sk-codiv-…` |
+| Get one at | https://console.typesafe.ai/keys | https://codiv.ai/dashboard |
+
+Having one key of each is best: text decisions go to TypeSafe and anything
+that needs a screenshot goes to codiv.
+
+1. Sign up at one or both, create a key, and copy it. TypeSafe shows a new key
+   only once.
+2. Give it to bx, either from the **bx toolbar popup** (paste it under *jev*,
+   then press **Add key**) or from a shell:
    ```bash
-   bx jev key sk-paste-your-key-here     # saved to ~/.bx/config.json, mode 0600
-   bx jev                                # should say the key is set; jev on
+   bx jev key                  # asks for the key without echoing it
+   bx jev                      # which service text and screenshots go to, every key and its status
    ```
-   Or, without saving it to disk: `export CODIV_API_KEY=sk-...` before starting
-   the bridge. `TYPESAFE_API_KEY` works too.
-4. Check it works: `bx open example.com` then `bx check "is this the example.com page"`
+   bx tells the two kinds apart by their prefix and tries each key once before
+   saving it, so a mistyped key is caught right away.
+3. Check it works: `bx open example.com` then `bx check "is this the example.com page"`
    should answer `yes` in about a second.
 
-Pricing and free credit are on https://codiv.ai/pricing; usage per call is
-shown by `bx jev`. Without a key bx still drives your browser, but `sift`,
-`pick`, `check` and `bx agent` need one. Never paste your key into a chat with
-an agent or commit it: it is only stored on your machine.
+Without a key bx still drives your browser, but `sift`, `pick`, `check` and
+`bx agent` need one. Never paste your key into a chat with an agent or commit
+it: it is only stored on your machine.
 
-### Setup
+### Several keys, and choosing the service
+
+Add as many keys of each kind as you like. Calls take turns across a
+service's keys, so two codiv keys give twice the requests per minute. A key
+that is rate-limited, out of credit or refused is set aside, and the call
+moves straight on to the next one.
 
 ```bash
-bx jev key sk-codiv-...     # or export CODIV_API_KEY
-bx jev                      # key, model, floor, and what it has cost so far
+bx jev key --label work     # another key, with a name to tell it apart
+bx jev keys                 # each key: service, label, masked key, status, calls
+bx jev rm work              # by label, id, or the key's last 4 characters
+bx jev use auto             # text → TypeSafe, screenshots → codiv, each falling back to the other
+bx jev use typesafe         # text to TypeSafe only (screenshots still need codiv)
+bx jev use codiv            # everything to codiv
 bx jev off                  # every agent run falls back to word matching
 ```
 
-The key is stored in `~/.bx/config.json` (0600) and is never logged or sent
-anywhere but codiv.ai. **No key ships with bx; bring your own from codiv.ai.**
+The popup does the same: choose **Auto / TypeSafe / codiv**, add a key, or
+remove one with ✕. Keys are stored by the bridge in `~/.bx/config.json`
+(0600), never in the browser, and are never logged or sent anywhere but the
+service that issued them. `TYPESAFE_API_KEY` and `CODIV_API_KEY` in the
+bridge's environment add a key without saving it to disk. **No key ships with
+bx; bring your own.**
+
 Without one, everything that does not need a model still works: driving the
 browser, `items`, multi-page collection, parallel `read`, site memory, and
 `agent --no-jev`. `sift`, `pick`, `check` and the jev agent say plainly that
@@ -385,6 +410,29 @@ mode**, click **Load unpacked**, and select the `extension/` folder. Run
 
 The bridge starts itself the first time any command runs. There is nothing to
 launch by hand and nothing that needs to stay open in a terminal.
+
+### Several browsers
+
+bx runs in any Chromium browser (Chrome, Brave, Edge, Opera, Vivaldi,
+Chromium), in as many profiles as you like. Load the same `extension/` folder
+in each. There is one bridge per computer, and every browser connects to it:
+
+- **Keys and settings are shared.** They live in the bridge, so a key added in
+  Brave's popup is used by Chrome too, and `bx jev` shows the same list
+  everywhere.
+- **Commands go to one browser at a time:** the one with a window open that
+  you used most recently. `bx status` names it, and `bx ext` lists every
+  connected browser and profile. A command about a tab id goes to whichever
+  browser has that tab.
+- **Load the extension from the same folder.** An unpacked extension's id
+  comes from its folder path, so the same folder gives the same id in every
+  Chromium browser. If you load a copy from somewhere else, it has a different
+  id and the bridge refuses it until you let it in. `bx status` shows the
+  refused id, and `bx ext allow <id>` lets it connect within a few seconds.
+  `bx ext forget <id>` removes it again.
+
+Firefox and Safari are not supported: bx needs Chrome's extension and debugger
+APIs.
 
 ## Using it
 
@@ -601,7 +649,21 @@ skill/      the agent-facing contract
 - Screenshots of a background tab go through CDP so the tab is never pulled
   into focus.
 - The first extension to connect claims the bridge, and its ID is pinned in
-  `~/.bx/config.json`. Delete `extension_id` there to re-pair.
+  `extension_ids` in `~/.bx/config.json`. See *Several browsers* below to let
+  in another.
+- bx works in its own window by default: a "bx" tab group in a window it
+  opens behind yours, so an agent can run while you browse — your tabs are
+  never navigated, switched or focused. Turn it off in the bx toolbar popup
+  to have bx drive the tab you are looking at; `--here` does that for one
+  command. It is a separate window rather than a group among your tabs
+  because Chrome stops rendering background tabs, and feeds never load in
+  them. Keep that window open and not minimized, for the same reason.
+- Loaded in several Chrome profiles, bx connects from each of them. Commands
+  go to the profile with a window open that was used most recently; a tab id
+  goes to the profile that holds it. `bx status` says how many are connected,
+  and warns when the one answering has no window open.
+- jev calls run 16 at a time (`bx jev set parallel=N`, up to 64). `sift`,
+  many-page `check` and `each --if` all fan out; `bx jev` shows the peak.
 - Chrome suspends the extension's service worker when it sits idle. Any
   browser activity wakes it back up within about a second, and `/do` waits
   for that, so the first command after a quiet stretch may take a moment

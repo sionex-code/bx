@@ -10,13 +10,46 @@ let portIdx = 0;
 let backoff = 200;
 let retryTimer = null;
 
+// Chrome runs one copy of this worker in every profile that has bx loaded,
+// and every copy dials the same bridge. This id says which profile a socket
+// is, so the bridge can let a restarted worker replace its own old socket
+// without knocking another profile's off — two profiles doing exactly that
+// every few seconds was the "no active tab" / "extension disconnected" loop.
+let IID = null;
+const iidReady = chrome.storage.local.get('iid').then(async (got) => {
+  IID = got.iid || crypto.randomUUID();
+  if (!got.iid) await chrome.storage.local.set({ iid: IID });
+}).catch(() => { IID = IID || crypto.randomUUID(); });
+
+// What the bridge needs to choose between profiles: whether the user has a
+// window open in this one, and how recently they used it. bx's own window is
+// left out — it says nothing about where the user is browsing.
+async function presence() {
+  const p = await place();
+  const all = await chrome.windows.getAll({ windowTypes: ['normal'] }).catch(() => []);
+  const wins = all.filter((w) => w.id !== p.win);
+  const tabs = (await chrome.tabs.query({}).catch(() => [])).filter((t) => t.windowId !== p.win);
+  const used = tabs.reduce((m, t) => Math.max(m, t.lastAccessed || 0), 0);
+  await modeReady;
+  return {
+    windows: wins.length, tabs: tabs.length, focused: wins.some((w) => w.focused), used: Math.round(used),
+    own: MODE.own, bxWindow: all.some((w) => w.id === p.win)
+  };
+}
+function report() {
+  if (!sock || sock.readyState !== 1) return;
+  const ws = sock;
+  presence().then((p) => { try { ws.send(JSON.stringify({ t: 'st', ...p })); } catch {} });
+}
+
 // ── connection ───────────────────────────────────────────────────────────
 function connect() {
   if (sock && (sock.readyState === 0 || sock.readyState === 1)) return;
+  if (!IID) { iidReady.then(connect); return; }
   clearTimeout(retryTimer); retryTimer = null;
   const port = PORTS[portIdx % PORTS.length];
   let ws;
-  try { ws = new WebSocket(`ws://127.0.0.1:${port}/ext`); }
+  try { ws = new WebSocket(`ws://127.0.0.1:${port}/ext?iid=${IID}`); }
   catch { return schedule(); }
   sock = ws;
   let opened = false;
@@ -31,12 +64,14 @@ function connect() {
     clearTimeout(stuck);
     backoff = 200;
     ws.send(JSON.stringify({ t: 'hi', ua: navigator.userAgent, chrome: navigator.userAgentData?.brands }));
+    report();
   };
   ws.onmessage = async (e) => {
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
     if (m.t === 'ka') { ws.send('{"t":"ka"}'); return; }
     if (m.t === 'hello' || m.t === 'cfg') { Object.assign(CFG, m.cfg || {}); return; }
+    if (m.t === 'rs') { const p = REQ.get(m.rid); if (p) { REQ.delete(m.rid); clearTimeout(p.timer); p.resolve(m.r); } return; }
     // Escape hatch: restarts the worker from a clean slate after an edit, or
     // when it has wedged badly enough that reconnecting is not enough.
     if (m.t === 'reload') { chrome.runtime.reload(); return; }
@@ -51,6 +86,7 @@ function connect() {
   ws.onclose = () => {
     clearTimeout(stuck);
     if (sock === ws) sock = null;
+    for (const [id, p] of REQ) { clearTimeout(p.timer); p.resolve({ ok: false, error: 'bridge disconnected' }); REQ.delete(id); }
     // Only walk to the next port when this one never answered. Advancing on
     // every close sent us hunting through 8788/8789 — ports the bridge never
     // binds — after any ordinary bridge restart, which is what made bx sit at
@@ -59,6 +95,22 @@ function connect() {
     schedule();
   };
   ws.onerror = () => { try { ws.close(); } catch {} };
+}
+
+// The popup's questions for the bridge: jev keys and settings live there, on
+// this computer, shared by every browser that has bx connected.
+const REQ = new Map();
+let rid = 0;
+function bridge(op, args) {
+  if (!sock || sock.readyState !== 1) return Promise.resolve({ ok: false, error: 'bridge not running — start it with bx status' });
+  const id = ++rid;
+  return new Promise((resolve) => {
+    // Adding a key tries it against the provider first, which can take a while.
+    const timer = setTimeout(() => { REQ.delete(id); resolve({ ok: false, error: 'the bridge did not answer' }); }, 20000);
+    REQ.set(id, { resolve, timer });
+    try { sock.send(JSON.stringify({ t: 'rq', rid: id, op, args })); }
+    catch (e) { clearTimeout(timer); REQ.delete(id); resolve({ ok: false, error: String(e.message || e) }); }
+  });
 }
 
 function schedule() {
@@ -74,9 +126,12 @@ chrome.alarms.onAlarm.addListener(() => { if (!sock || sock.readyState > 1) conn
 // Ordinary browsing wakes a dormant worker far sooner than the alarm would,
 // so the bridge is reachable within a keystroke of the browser starting.
 const wake = () => { if (!sock || sock.readyState > 1) connect(); };
-chrome.tabs.onActivated.addListener(wake);
+const wakeAndReport = () => { wake(); report(); };
+chrome.tabs.onActivated.addListener(wakeAndReport);
 chrome.tabs.onUpdated.addListener(wake);
-chrome.windows.onFocusChanged.addListener(wake);
+chrome.windows.onFocusChanged.addListener(wakeAndReport);
+chrome.windows.onCreated.addListener(wakeAndReport);
+chrome.windows.onRemoved.addListener(wakeAndReport);
 connect();
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -91,18 +146,133 @@ function withTimeout(p, ms, what) {
 }
 
 async function resolveTab(spec) {
-  if (typeof spec === 'number') return spec;
+  if (typeof spec === 'number') {
+    // Tab ids are unique across profiles, but each profile sees only its own.
+    // Refuse the whole batch up front so the bridge asks the profile that has it.
+    try { await chrome.tabs.get(spec); } catch { throw new Error(`No tab with id: ${spec}`); }
+    return spec;
+  }
+  // --here: the tab the user is looking at, whatever the mode.
+  if (spec === 'user') return userTab();
   if (spec && spec !== 'active' && spec !== 'current') {
     const all = await chrome.tabs.query({});
     const hit = all.find((t) => (t.url || '').includes(String(spec)) || (t.title || '').toLowerCase().includes(String(spec).toLowerCase()));
     if (hit) return hit.id;
     throw new Error(`no tab matching "${spec}"`);
   }
+  await modeReady;
+  return MODE.own ? ownTab() : userTab();
+}
+
+async function userTab() {
   let [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!t) [t] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!t) [t] = await chrome.tabs.query({ active: true });
-  if (!t) throw new Error('no active tab');
+  // Every window in this profile is closed, so there is truly nothing to act
+  // on. Open one rather than failing: whatever the batch does next (nav,
+  // open) points the tab at the real URL anyway. The bridge only sends here
+  // when no other connected profile has a window.
+  if (!t) t = await openTab('about:blank', true);
   return t.id;
+}
+
+// ── where bx works ───────────────────────────────────────────────────────
+// Own-window mode, on unless switched off in the toolbar popup: bx keeps a
+// window of its own, its tabs in a "bx" tab group, and works only there.
+// "The active tab" means bx's tab, so an agent can run while the user keeps
+// browsing — nothing of theirs is navigated, switched or focused. A window
+// and not a group in the user's window, because Chrome treats a background
+// tab as hidden: it stops rendering it and slows its timers, and infinite
+// feeds and lazy lists never fill in. Off: act on whatever tab is active.
+const MODE = { own: true };
+const modeReady = chrome.storage.local.get('ownWindow')
+  .then((g) => { MODE.own = g.ownWindow !== false; }).catch(() => {});
+chrome.storage.onChanged.addListener((ch, area) => {
+  if (area === 'local' && ch.ownWindow) { MODE.own = ch.ownWindow.newValue !== false; report(); }
+});
+
+// bx's window, group and working tab. Session storage, because the worker is
+// torn down whenever it idles. Chrome clears it when the extension reloads
+// or the browser restarts; ownWindow() then finds the window by its group.
+const place = () => chrome.storage.session.get('bx').then((g) => g.bx || {}).catch(() => ({}));
+const setPlace = (p) => chrome.storage.session.set({ bx: p }).catch(() => {});
+
+async function groupIn(win, tabIds, group) {
+  try {
+    if (group !== undefined) { try { return await chrome.tabs.group({ tabIds, groupId: group }); } catch {} }
+    const g = await chrome.tabs.group({ tabIds, createProperties: { windowId: win } });
+    await chrome.tabGroups.update(g, { title: 'bx', color: 'purple' });
+    return g;
+  } catch { return undefined; }   // cosmetic: a window without the group still works
+}
+
+// Parallel reads open several tabs at once on a cold start; one window, not six.
+let making = null;
+async function ownWindow() {
+  const p = await place();
+  if (p.win !== undefined && await chrome.windows.get(p.win).catch(() => null)) return p;
+  if (!making) {
+    making = (async () => {
+      // Lost track of it, not lost it: a window holding a "bx" group is bx's.
+      // Without this every extension reload opened another bx window.
+      const [g] = await chrome.tabGroups.query({ title: 'bx' }).catch(() => []);
+      if (g) {
+        const [a] = await chrome.tabs.query({ active: true, windowId: g.windowId });
+        const [t] = await chrome.tabs.query({ groupId: g.id });
+        const np = { win: g.windowId, tab: (a && a.groupId === g.id ? a : t || a)?.id, group: g.id };
+        await setPlace(np);
+        return np;
+      }
+      // Unfocused, so it opens behind what the user is doing. Never minimized:
+      // Chrome pauses pages in a minimized window just as in a background tab.
+      const w = await chrome.windows.create({ url: 'about:blank', focused: false, state: 'normal' });
+      const np = { win: w.id, tab: w.tabs[0].id };
+      np.group = await groupIn(w.id, [np.tab]);
+      await setPlace(np);
+      return np;
+    })().finally(() => { making = null; });
+  }
+  return making;
+}
+
+async function ownTab() {
+  const p = await ownWindow();
+  if (p.tab !== undefined && await chrome.tabs.get(p.tab).catch(() => null)) return p.tab;
+  // bx's tab was closed: the window's active tab is bx's now, or a fresh one.
+  let [a] = await chrome.tabs.query({ active: true, windowId: p.win });
+  if (!a) a = await chrome.tabs.create({ windowId: p.win, url: 'about:blank', active: true });
+  await setPlace({ win: p.win, tab: a.id, group: p.group });
+  return a.id;
+}
+
+// A new tab. In own-window mode it goes into bx's window and group, and a
+// foreground one becomes bx's tab. Otherwise into the user's window — and a
+// profile with every window closed still runs this worker, where tabs.create
+// has no window to put the tab in.
+async function openTab(url, active) {
+  await modeReady;
+  if (MODE.own) {
+    const p = await ownWindow();
+    // bx's tab still blank — the window was just opened for this — is used
+    // rather than left behind empty. Only for a foreground tab: background
+    // reads close their tabs when done, and closing that one would close the
+    // whole window.
+    if (active) {
+      const cur = p.tab !== undefined ? await chrome.tabs.get(p.tab).catch(() => null) : null;
+      if (cur && cur.windowId === p.win && (cur.url || cur.pendingUrl || 'about:blank') === 'about:blank') {
+        return url ? chrome.tabs.update(cur.id, { url, active: true }) : cur;
+      }
+    }
+    const t = await chrome.tabs.create({ windowId: p.win, url, active });
+    const g = await groupIn(p.win, [t.id], p.group);
+    const now = await place();
+    await setPlace({ win: p.win, tab: active ? t.id : now.tab ?? p.tab, group: g ?? p.group });
+    return t;
+  }
+  const wins = await chrome.windows.getAll({ windowTypes: ['normal'] }).catch(() => []);
+  if (wins.length) return chrome.tabs.create({ url, active });
+  const w = await chrome.windows.create({ url, focused: active });
+  return w.tabs[0];
 }
 
 async function inject(tabId, frameId) {
@@ -128,7 +298,7 @@ function ask(tabId, frameId, payload) {
 // Anything that only observes, so re-running it after the page moved under us
 // costs nothing. A click is deliberately not on this list: if it navigated, it
 // already did its job, and doing it again on the new page would not be a retry.
-const REPEATABLE = new Set(['wait', 'exists', 'read', 'elements', 'info', 'box', 'path']);
+const REPEATABLE = new Set(['wait', 'exists', 'read', 'elements', 'info', 'box', 'path', 'matches']);
 const isGone = (e) => /Could not establish connection|Receiving end does not exist/i.test(String(e && e.message));
 // A click that triggers navigation leaves the old document in bfcache with our
 // message port still attached, and the port dies with it. The action was
@@ -212,7 +382,7 @@ function probeFrames(tabId, frames, action, cfg, budget) {
 // real miss should pay for enumerating frames. It is wrong for an action whose
 // whole job is to wait: `wait` and `exists` were being handed 150ms and
 // answering "timed out" / "no" long before their own deadline.
-const MAIN_SHARE = { wait: 1, exists: 1, fill: 0.6 };
+const MAIN_SHARE = { wait: 1, exists: 1, matches: 1, fill: 0.6 };
 
 async function toContent(tabId, action, cfg) {
   const total = action.timeout ?? cfg.timeout ?? 8000;
@@ -501,11 +671,16 @@ W.reload = async (tabId, a) => { loadErr.delete(tabId); await chrome.tabs.reload
 
 W.tabs = async () => {
   const tabs = await chrome.tabs.query({});
-  return { n: tabs.length, tabs: tabs.map((t) => ({ id: t.id, active: t.active || undefined, title: (t.title || '').slice(0, 70), url: t.url, win: t.windowId, audible: t.audible || undefined })) };
+  const p = await place();
+  return { n: tabs.length, tabs: tabs.map((t) => ({
+    id: t.id, active: t.active || undefined, title: (t.title || '').slice(0, 70), url: t.url, win: t.windowId, audible: t.audible || undefined,
+    // Which tab "the active tab" means for bx right now, and which are bx's.
+    bx: (MODE.own && t.windowId === p.win) || undefined, work: (MODE.own && t.id === p.tab) || undefined
+  })) };
 };
 
 W.newtab = async (_t, a) => {
-  const t = await chrome.tabs.create({ url: a.url ? toUrl(a.url) : undefined, active: a.active !== false });
+  const t = await openTab(a.url ? toUrl(a.url) : undefined, a.active !== false);
   if (a.url && a.wait !== false) await waitForLoad(t.id, a.timeout ?? 20000);
   if (a.url) {
     // The tab is left open either way: a caller that opened it owns closing
@@ -519,6 +694,17 @@ W.newtab = async (_t, a) => {
 
 W.tab = async (_t, a) => {
   const id = await resolveTab(a.id ?? a.target);
+  await modeReady;
+  if (MODE.own) {
+    // Switching makes it the tab bx acts on. Inside bx's window it is also
+    // brought forward there; a tab of the user's is used where it is, never
+    // pulled to the front of their window.
+    const t = await chrome.tabs.get(id);
+    const p = await ownWindow();
+    if (t.windowId === p.win) await chrome.tabs.update(id, { active: true });
+    await setPlace({ ...p, tab: id });
+    return { id, url: t.url, title: t.title };
+  }
   await chrome.tabs.update(id, { active: true });
   const t = await chrome.tabs.get(id);
   await chrome.windows.update(t.windowId, { focused: true }).catch(() => {});
@@ -530,6 +716,26 @@ W.closetab = async (tabId, a) => {
   await chrome.tabs.remove(id);
   return { closed: id };
 };
+
+// The toolbar popup asks whether the bridge is reachable and where bx works.
+chrome.runtime.onMessage.addListener((m, sender, respond) => {
+  // Keys and settings: from the popup page only. Content scripts run inside
+  // every website and can message this worker too, so they are refused here.
+  if (m && m.t === 'jev') {
+    const fromPopup = sender.id === chrome.runtime.id && String(sender.url || '').startsWith(chrome.runtime.getURL('popup.html'));
+    if (!fromPopup || !['jev', 'jev.set', 'jev.add', 'jev.rm'].includes(m.op)) return;
+    bridge(m.op, m.args || {}).then(respond);
+    return true;
+  }
+  if (!m || m.t !== 'popup') return;
+  (async () => {
+    await modeReady;
+    const p = await place();
+    const win = p.win !== undefined ? await chrome.windows.get(p.win, { populate: true }).catch(() => null) : null;
+    respond({ connected: !!sock && sock.readyState === 1, own: MODE.own, win: win ? { id: win.id, tabs: win.tabs.length, state: win.state } : null });
+  })();
+  return true;
+});
 
 W.shot = (tabId, a, cfg) => shot(tabId, a, cfg);
 
