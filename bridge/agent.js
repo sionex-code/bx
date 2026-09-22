@@ -329,7 +329,7 @@ async function jevBrain(ctx, cfg, image) {
   const blocked = verb === 'blocked' && op.confidence >= cfg.min_confidence;
 
   return {
-    brain: 'jev', model: r.model, ms: r.ms, usage: r.usage, state: s, saw: !!image,
+    brain: 'jev', model: r.model, provider: r.provider, ms: r.ms, usage: r.usage, state: s, saw: !!r.saw,
     done, blocked, donep: Math.max(verb === 'done' ? op.p : 0, fin.p ?? 0),
     // An element operation whose target head gave nothing usable is a scroll:
     // whatever is needed is not in this list yet.

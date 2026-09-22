@@ -234,9 +234,31 @@ const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'TEMPLATE', 'IFRAME'
 // bx reads a page, such text is marked as what it is.
 const editRoot = (n) => n && n.nodeType === 1 && n.isContentEditable && !(n.parentElement && n.parentElement.isContentEditable);
 const fieldName = (el) => (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || el.getAttribute('name') || 'a text box').slice(0, 60);
+// The editable box a node sits in, if someone typed into it.
+const typedHost = (n) => { for (; n; n = n.parentElement) if (editRoot(n)) return BX.edited.has(n); return false; };
 const draftMark = (el, t) => `[unsent text in "${fieldName(el)}": ${t.replace(/\s+/g, ' ').trim().slice(0, 300)}]`;
-BX.drafts = (root = document) => {
+
+// Only a box something was typed into holds a draft, by bx or by the user.
+// The page's own value is not one: Google's search box holds the query from
+// the URL, and taking that for unsent text made the Google account button
+// beside it "the send button" — jev was told to click it, and did.
+BX.edited = BX.edited || new WeakSet();
+if (!BX.editWatch) {
+  BX.editWatch = true;
+  document.addEventListener('input', (e) => {
+    const t = (e.composedPath && e.composedPath()[0]) || e.target;
+    if (!t || t.nodeType !== 1) return;
+    BX.edited.add(t);
+    for (let n = t; n; n = n.parentElement) if (editRoot(n)) { BX.edited.add(n); break; }
+  }, true);
+}
+// `texts`: text bx typed and is checking on. A box holding it counts even if
+// the page swapped the element for a new one after the typing.
+BX.drafts = (root = document, texts) => {
   const out = [];
+  const squash = (x) => x.replace(/\s+/g, ' ').trim();
+  // The bridge remembers typed text lowercased.
+  const mine = (texts || []).map((x) => squash(x).toLowerCase()).filter(Boolean);
   // Inside shadow roots too: Reddit's Title box lives in one, and a box the
   // check cannot see reads as "the text left it", i.e. sent.
   const roots = root === document ? BX.roots() : [root];
@@ -245,11 +267,12 @@ BX.drafts = (root = document) => {
     if (el.tagName !== 'TEXTAREA' && el.tagName !== 'INPUT' && !editRoot(el)) continue;
     const t = (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' ? el.value : el.innerText) || '';
     if (!t.trim() || !BX.visible(el)) continue;
-    out.push({ el, label: fieldName(el), text: t.replace(/\s+/g, ' ').trim() });
+    if (!BX.edited.has(el) && !mine.some((m) => squash(t).toLowerCase().includes(m))) continue;
+    out.push({ el, label: fieldName(el), text: squash(t) });
   }
   return out;
 };
-A.drafts = async () => ({ drafts: BX.drafts().map((d) => ({ ref: BX.ref(d.el), label: d.label, text: d.text.slice(0, 300) })) });
+A.drafts = async (a) => ({ drafts: BX.drafts(document, a && a.texts).map((d) => ({ ref: BX.ref(d.el), label: d.label, text: d.text.slice(0, 300) })) });
 
 const toMd = (root) => {
   const out = [];
@@ -257,7 +280,7 @@ const toMd = (root) => {
     if (!n || depth > 40) return;
     if (n.nodeType === 3) { const t = n.textContent.replace(/\s+/g, ' '); if (t.trim()) out.push(t); return; }
     if (n.nodeType !== 1 || SKIP.has(n.tagName)) return;
-    if (editRoot(n)) { const t = n.innerText || ''; if (t.trim()) out.push(`\n${draftMark(n, t)}\n`); return; }
+    if (editRoot(n) && BX.edited.has(n)) { const t = n.innerText || ''; if (t.trim()) out.push(`\n${draftMark(n, t)}\n`); return; }
     const st = n.ownerDocument.defaultView?.getComputedStyle(n);
     if (st && (st.display === 'none' || st.visibility === 'hidden')) return;
     const tag = n.tagName;
@@ -386,7 +409,7 @@ const shown = (el) => BX.visible(el) || (getComputedStyle(el).display === 'conte
 const pieces = (el) => {
   const out = [];
   const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
-    acceptNode: (n) => (SKIP.has(n.parentElement?.tagName) || n.parentElement?.isContentEditable ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT)
+    acceptNode: (n) => (SKIP.has(n.parentElement?.tagName) || (n.parentElement?.isContentEditable && typedHost(n.parentElement)) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT)
   });
   for (let n = w.nextNode(); n; n = w.nextNode()) {
     const t = n.textContent.replace(/\s+/g, ' ').trim();
@@ -531,6 +554,49 @@ A.exists = async (a) => {
   catch { return { exists: false }; }
 };
 
+// Everything a target matches, best-ranked first, each with enough of its
+// surroundings to tell identical buttons apart: the text of the post or row
+// it sits in, and the smallest box it shares with text typed but not sent.
+// The bridge hands this to jev when more than one live element matches,
+// instead of acting on whichever came first in the document.
+const ITEM = 'article,li,tr,[role=article],[role=listitem],[role=row],[data-id],[data-urn]';
+const around = (el) => {
+  const item = el.closest(ITEM);
+  let n = item || el.parentElement;
+  for (let up = 0; !item && n && up < 6 && (n.innerText || '').trim().length < 60; up++) n = n.parentElement;
+  return n ? (n.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 160) : '';
+};
+A.matches = async (a) => {
+  const deadline = Date.now() + (a.timeout ?? 0);
+  let pool = BX.matches(a.target, { in: a.in });
+  while (!pool.length && Date.now() < deadline) { await BX.sleep(80); pool = BX.matches(a.target, { in: a.in }); }
+  const drafts = BX.drafts();
+  // Counted in elements, not levels: a post's own "Comment" button and the
+  // composer's submit are both one level from a box holding the text, but
+  // one of those boxes is the whole post and the other is just the composer.
+  // A send button also comes after its text box.
+  const near = (el) => {
+    let best;
+    for (const d of drafts) {
+      if (d.el === el) continue;
+      let n = el.parentElement;
+      while (n && !n.contains(d.el)) n = n.parentElement;
+      if (!n) continue;
+      const size = n.getElementsByTagName('*').length;
+      if (!best || size < best.size) best = { size, after: !!(d.el.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) };
+    }
+    return best;
+  };
+  return {
+    url: location.href, title: document.title, n: pool.length,
+    items: pool.slice(0, a.max || 12).map((el) => ({
+      ...BX.describe(el), where: BX.region(el), sec: BX.section(el),
+      field: isBox(el) || undefined, ctx: around(el) || undefined, near: near(el)
+    })),
+    drafts: drafts.map((d) => ({ label: d.label, text: d.text.slice(0, 160) }))
+  };
+};
+
 A.box = async (a) => {
   const el = await BX.want(a.target, opt(a));
   await BX.ensureVisible(el);
@@ -543,6 +609,9 @@ A.path = async (a) => { const el = await BX.want(a.target, opt(a)); return { css
 A.info = async () => ({
   url: location.href, title: document.title,
   ready: document.readyState,
+  // "hidden" means Chrome has stopped rendering the page and slowed its
+  // timers: a minimized window or a background tab. Feeds will not load.
+  visible: document.visibilityState,
   scroll: [Math.round(scrollX), Math.round(scrollY)],
   size: [innerWidth, innerHeight],
   page: [Math.round(document.documentElement.scrollWidth), Math.round(document.documentElement.scrollHeight)],
