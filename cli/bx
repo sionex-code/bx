@@ -27,6 +27,7 @@ const dim = c('2'), bold = c('1'), red = c('31'), grn = c('32'), yel = c('33'), 
 const OK = TTY ? grn('✓') : 'ok', BAD = TTY ? red('✗') : 'ERR', DOT = dim('·');
 
 const trunc = (s, n) => { s = String(s ?? '').replace(/\s+/g, ' '); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+const plural = (n, w) => `${n ?? '?'} ${w}${n === 1 ? '' : 's'}`;
 const ms = (n) => dim(String(n).padStart(5) + 'ms');
 
 function die(msg, code = 1) { console.error(`${BAD} ${msg}`); process.exit(code); }
@@ -76,7 +77,7 @@ function req(method, route, body, port, token) {
     const r = http.request({
       host: '127.0.0.1', port, path: route, method,
       headers: Object.assign(
-        { 'x-bx-token': token || '' },
+        { 'x-bx-token': token || '' }, browserHeader(),
         data ? { 'content-type': 'application/json', 'content-length': data.length } : {}
       )
     }, (res) => {
@@ -90,6 +91,9 @@ function req(method, route, body, port, token) {
     r.end();
   });
 }
+
+// --browser <n|name>: this one command goes to that browser (bx browsers lists them).
+const browserHeader = () => (typeof flags.browser === 'string' && flags.browser ? { 'x-bx-browser': flags.browser } : {});
 
 const alive = async (port) => { try { const r = await req('GET', '/health', undefined, port, ''); return r.body.up === true; } catch { return false; } };
 
@@ -124,7 +128,7 @@ async function stream(route, payload, online) {
   return new Promise((resolve, reject) => {
     const r = http.request({
       host: '127.0.0.1', port: cfg.port, path: route, method: 'POST',
-      headers: { 'x-bx-token': cfg.token, 'content-type': 'application/json', 'content-length': data.length }
+      headers: { 'x-bx-token': cfg.token, 'content-type': 'application/json', 'content-length': data.length, ...browserHeader() }
     }, (res) => {
       let buf = '';
       const last = { v: null };
@@ -155,7 +159,7 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a.startsWith('--')) {
     const [k, v] = a.slice(2).split('=');
-    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out', 'last', 'if', 'check', 'do', 'with', 'without', 'in', 'label', 'provider'].includes(k) ? argv[++i] : true) : v;
+    flags[k] = v === undefined ? (argv[i + 1] && !argv[i + 1].startsWith('--') && ['tab', 'speed', 'timeout', 'max', 'mode', 'format', 'quality', 'to', 'by', 'nth', 'has', 'near', 'filter', 'host', 'back', 'note', 'steps', 'hint', 'brain', 'confidence', 'model', 'key', 'target', 'chars', 'pages', 'parallel', 'file', 'budget', 'out', 'last', 'if', 'check', 'do', 'with', 'without', 'in', 'label', 'provider', 'browser', 'save', 'find', 'sort', 'top'].includes(k) ? argv[++i] : true) : v;
   } else args.push(a);
 }
 const num = (v) => (v === undefined ? undefined : Number(v));
@@ -374,7 +378,9 @@ function agentEnd(out) {
 // An ambiguous target is not an error, so it never reaches the red path — but
 // it is the single most likely reason a step "worked" and nothing happened.
 const amb = (r) =>
-  (r && r.picked ? (r.picked.unsure
+  (r && r.picked ? (r.picked.by === 'same'
+    ? dim(`  ${DOT} ${r.picked.of} matched, all links to the same page`)
+    : r.picked.unsure
     ? yel(`  ${DOT} ${r.picked.of} matched, jev unsure `) + pct(r.picked.confidence) + yel(' — took the first')
     : r.picked.by === 'layout'
       ? mag(`  ${DOT} ${r.picked.of} matched, jev unsure `) + pct(r.picked.confidence) + mag(' — took the one right after your unsent text')
@@ -467,9 +473,14 @@ ${bold('agent')}  ${dim('jev decides the next move from the live page — on by 
                               ${dim('--see     show jev a screenshot every step  (--no-see: never)')}
   pick <description>          which element is "the search box"  ${dim('→ ref + selector')}
   check <question>            yes/no about this page, with a probability  ${dim('--see')}
-  check <question> <url>...   same question on many pages at once, in background tabs  ${dim('--parallel N --file F')}
+  check <question> <url>...   same question on many pages at once, in background tabs  ${dim('--parallel N --file F --save yes.txt')}
   sift <criterion>            judge every item in the page's list at once  ${dim('--pages N --all --max N --target SEL')}
-  items [target]              the page's repeated list (results, cards, rows) as items, no model  ${dim('--pages N')}
+  sift <criterion> <url>...   the same over many search/result URLs in one command, repeats merged
+                              ${dim('--save keep.txt  append kept links to a file (then: bx check "…" --file keep.txt)')}
+                              ${dim('--parallel N     lists at once in background tabs (default 6; feeds finish in front)')}
+  items [target]              the page's repeated list (results, cards, rows) as items, no model  ${dim('--pages N --save links.txt')}
+  items <url>... --sort WORD  many lists in one command, ranked by the number before WORD
+                              ${dim('bx items "<search url>" "<search url>" --pages 3 --sort members  → biggest first')}
   each [list] --if C --check Q --do '[…]'
                               for every row of the list: keep rows matching C (from their text;
                               ${dim('--with T / --without T for an exact text rule')}),
@@ -478,7 +489,13 @@ ${bold('agent')}  ${dim('jev decides the next move from the live page — on by 
   jev [key|keys|rm|use|on|off|model|set|ask]
                               ${dim('key: add a TypeSafe (apikey_…) or codiv (sk-codiv-…) key, asked for hidden; any number of each')}
                               ${dim('use auto|typesafe|codiv  ·  rm <id|label>  ·  set parallel=N (16)')}
-  ext [allow|forget <id>]     ${dim('browsers with bx connected; let in bx loaded from another folder')}
+  ext [allow|forget <id>]     ${dim('let in bx loaded from another folder')}
+
+${bold('browsers')}  ${dim('bx in Chrome, Brave, Edge… and several profiles at once')}
+  browsers                    every connected browser, numbered; ${dim('* = where commands go')}
+  use <n|name|auto>           send commands to that browser from now on ${dim('(also in the toolbar popup)')}
+  browsers name <n> <label>   call a profile something ("work", "personal")
+  --browser <n|name>          ${dim('this one command only: bx open x.com --browser brave')}
 
 ${bold('page')}
   open <url>                  navigate current tab
@@ -511,6 +528,8 @@ ${bold('tabs')}  ${dim('by default bx works in its own "bx" window and never tou
 
 ${bold('memory')}  ${dim('bx learns every site as you drive it — flows, selectors, traps')}
   memo [host]                 everything known about a site   ${dim('--all to list sites')}
+  memo --find "<words>"       search notes, recipes and URL lessons on every site
+  memo --prune                drop sites bx only read and learned nothing from  ${dim('--dry')}
   learn <name>                name the flow you just ran      ${dim('--last N: your last N actions, across commands')}
   recipe <name> [url] [var=val...]  replay it, optionally on another page  ${dim('bx memo names the vars')}
   note <text>                 remember something about this site
@@ -553,6 +572,21 @@ function journalFor(kind, key, urls) {
   return flags.out ? path.resolve(flags.out) : path.join(HOME, 'runs', `${kind}-${h}.jsonl`);
 }
 
+// --save FILE: links go straight into a file, one per line, added to what is
+// there and never twice. That file is what the next command takes (--file),
+// so sift → check → read chains with no script in between.
+function saveLinks(urls) {
+  if (typeof flags.save !== 'string') return null;
+  const file = path.resolve(flags.save);
+  let have = [];
+  try { have = fs.readFileSync(file, 'utf8').split(/\s+/).filter(Boolean); } catch {}
+  const seen = new Set(have);
+  const add = [...new Set(urls.filter((u) => u && /^https?:\/\//i.test(u)))].filter((u) => !seen.has(u));
+  try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.appendFileSync(file, add.map((u) => u + '\n').join('')); } catch (e) { die(`could not write ${file}: ${e.message}`); }
+  return { file: flags.save, added: add.length, total: have.length + add.length };
+}
+const savedLine = (sv, next) => sv && console.log(`  ${mag('▸')} ${bold(`${sv.added} new link${sv.added === 1 ? '' : 's'}`)} ${dim(`saved to ${sv.file} (${sv.total} in it)`)}${next ? dim(` · next: `) + bold(next) : ''}`);
+
 async function manyUrls(kind, route, key, urls, payload, show) {
   urls = [...new Set(urls)];
   const file = journalFor(kind, key, urls);
@@ -567,10 +601,11 @@ async function manyUrls(kind, route, key, urls, payload, show) {
   }
   const todo = urls.filter((u) => !prior.has(u));
   const budget = flags.budget === undefined ? 75 : Number(flags.budget);
-  const par = Math.max(1, Math.min(num(flags.parallel) || 6, 12));
+  const par = Math.max(1, Math.min(num(flags.parallel) || 6, 16));
   try { fs.mkdirSync(path.dirname(file), { recursive: true }); } catch {}
   if (prior.size && !flags.json) console.log(dim(`resuming · ${prior.size} of ${urls.length} already done, in ${file}`));
   if (!todo.length) {
+    manyUrls.last = [...prior.values()];
     if (flags.json) { console.log(JSON.stringify({ ok: true, n: urls.length, journal: file, results: urls.map((u) => prior.get(u)) }, null, 2)); return 0; }
     console.log(`${OK} all ${urls.length} pages already done ${dim(`— results in ${file}  (--fresh to redo)`)}`);
     return 0;
@@ -598,6 +633,7 @@ async function manyUrls(kind, route, key, urls, payload, show) {
     if (left || errs) console.log(`  ${mag('▸')} ${bold(`${left + errs} left`)} ${dim('— run the exact same command again; finished pages are skipped, failed ones retried')}`);
     else if (prior.size) console.log(`  ${mag('▸')} ${dim(`complete — earlier pages are in the journal, one JSON object per line`)}`);
   }
+  manyUrls.last = [...all.values()];
   return left || errs ? 3 : 0;
 }
 
@@ -640,8 +676,8 @@ async function main() {
       const inst = s.instances || [];
       const p = inst.find((x) => x.primary) || {};
       if (inst.length > 1) {
-        const names = inst.map((x) => `${x.browser || 'browser'}${x.primary ? '*' : ''}`).join(', ');
-        console.log(`             ${dim(`${inst.length} browsers/profiles have bx (${names}) — commands go to the one last in use (* · ${p.windows ?? '?'} windows, ${p.tabs ?? '?'} tabs); bx ext lists them`)}`);
+        console.log(`  browsers   ${inst.length} connected ${dim(s.chosen ? (s.chosen.connected ? '— commands go to the one you chose (bx use auto: the one last in use)' : `— the one you chose (${s.chosen.label || s.chosen.iid}) is not connected, so the one last in use`) : '— commands go to the one last in use; bx use <n> to pick')}`);
+        for (const x of inst) console.log(`             ${x.primary ? grn('*') : ' '} ${bold(String(x.n))} ${(x.label ? `${x.browser} "${x.label}"` : x.browser || 'browser').padEnd(18)} ${dim(`${plural(x.windows, 'window')}, ${plural(x.tabs, 'tab')} · ${x.iid}`)}`);
       }
       for (const x of s.refused || []) {
         console.log(`  ${yel('▲')} ${yel(`an extension with another id tried to connect (${x.browser || 'a browser'}, ${x.tries} tries)`)} ${dim('— bx loaded from a different folder.')} ${dim('If it is yours:')} bx ext allow ${x.id}`);
@@ -686,6 +722,23 @@ async function main() {
 
     // ── memory ───────────────────────────────────────────────────────────
     case 'memo': case 'memory': {
+      // Search every site at once: "did I save how to do this somewhere?"
+      if (flags.find !== undefined) {
+        const q = typeof flags.find === 'string' ? flags.find : args.join(' ');
+        if (!q) die('bx memo --find "<words>"');
+        const { hits } = await api('GET', `/memory?find=${encodeURIComponent(q)}`);
+        if (flags.json) return void console.log(JSON.stringify(hits, null, 2));
+        if (!hits.length) return void console.log(dim(`  nothing saved matches "${q}" on any site — it has not been done before, so work it out and bx note it`));
+        for (const h of hits) console.log(`  ${bold(h.host.padEnd(24))} ${mag(h.kind.padEnd(6))} ${h.name ? `${bold(h.name)}  ` : ''}${trunc(h.text, 150)}`);
+        return;
+      }
+      if (flags.prune) {
+        const r = await api('POST', '/memory/prune', { dry: !!flags.dry });
+        if (!r.pruned.length) return void console.log(dim('  nothing to prune'));
+        console.log(`${OK} ${r.dry ? 'would remove' : 'removed'} ${r.pruned.length} sites bx only ever read ${dim('(no notes, recipes, URL lessons or flows)')}`);
+        console.log(dim(`  ${r.pruned.join(' · ')}`));
+        return;
+      }
       if (flags.all) {
         const { hosts } = await api('GET', '/memory?all=1');
         if (flags.json) return void console.log(JSON.stringify(hosts, null, 2));
@@ -807,6 +860,9 @@ async function main() {
           console.log(`${a.answer ? grn('yes') : red('no ')}  ${pct(a.answer ? a.p : 1 - (a.p ?? 0))}  ${trunc(x.title || x.url, 58).padEnd(58)} ${dim(`${x.via} ${secs(x.ms)}`)}${eye(x)}\n     ${dim(x.url)}`);
         });
         if (!flags.json && yes) console.log(dim(`${yes} yes in this call`));
+        // Every page answered yes so far, this call and earlier ones.
+        const sv = saveLinks((manyUrls.last || []).filter((x) => x.answers && x.answers[0]?.answer && !x.unreadable).map((x) => x.asked || x.url));
+        if (!flags.json) savedLine(sv, sv && `bx read --file ${sv.file} --max 1500`);
         if (!flags.json && unread) console.log(`  ${mag('▸')} ${yel(`${unread} page${unread > 1 ? 's' : ''} could not be read`)} ${dim('— their answer is unknown, not no. Open one (bx open <url>) to see why: a login wall, an error, or a page that only renders after a click.')}`);
         process.exit(code);
       }
@@ -883,30 +939,85 @@ async function main() {
     }
 
     case 'items': {
-      const r = await api('POST', '/items', { ...common(), target: args[0] || flags.target || (typeof flags.in === 'string' ? flags.in : undefined), max: num(flags.max) || 60, chars: num(flags.chars), pages: num(flags.pages) });
+      // URLs: read the list off each of them in one command (bx items <url> <url> … --sort members).
+      const urls = args.filter((x) => /^https?:\/\//i.test(x));
+      if (flags.file) urls.push(...fs.readFileSync(flags.file, 'utf8').split(/\s+/).filter((x) => /^https?:\/\//i.test(x)));
+      const tgt = args.find((x) => !/^https?:\/\//i.test(x)) || flags.target || (typeof flags.in === 'string' ? flags.in : undefined);
+      if (typeof tgt === 'string' && /\s--\w/.test(tgt)) die(`"${tgt}" has flags inside the quotes — the target is only the CSS of the list: bx items ${bold('--sort members')}, not bx items 'x --sort members'`);
+      const sort = typeof flags.sort === 'string' ? flags.sort : undefined;
+      // Ranking, "--max 10" means "show me ten": models pass it that way, and
+      // as a read cap it cut each scroll to ten rows and missed bigger ones.
+      if (sort && flags.max !== undefined && flags.top === undefined) { flags.top = flags.max; delete flags.max; }
+      const r = await api('POST', '/items', { ...common(), urls: urls.length ? urls : undefined, parallel: num(flags.parallel), fresh: !!flags.fresh, budget: urls.length ? (flags.budget === undefined ? 100 : Number(flags.budget)) * 1000 : undefined, target: tgt, max: num(flags.max) || 60, chars: num(flags.chars), pages: num(flags.pages), sort });
       if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
       if (!r.ok) die(r.error || 'items failed');
       if (!r.n) die('no repeated list found — narrow it: bx items "<css of the list>"');
+      // Flat, one row per entry: many lists pooled, or ranked by a number.
+      if (r.items) {
+        for (const x of r.sources || []) {
+          if (x?.error) console.log(`${red('err')}  ${trunc(x.url, 80)}  ${dim(trunc(x.error, 70))}`);
+          else if (x?.skipped) console.log(`${yel('skip')} ${trunc(x.url, 80)}  ${dim('out of time — run again with just those URLs')}`);
+          else if (x) console.log(dim(`${String(x.n).padStart(3)} rows · ${x.pages} page${x.pages === 1 ? '' : 's'}${x.cached !== undefined ? ` · cached ${x.cached}s ago (--fresh to reload)` : ''} · ${trunc(x.url, 80)}`));
+        }
+        // No row had a number to rank by: the rows unranked beat an empty
+        // answer after a minute of loading.
+        const ranked = sort && r.items.some((x) => x.value != null);
+        const show = ranked ? r.items.filter((x) => x.value != null) : r.items;
+        const by = r.items[0]?.by === 'brackets' ? `the number in brackets — no row says "${sort}"` : sort;
+        console.log(dim(`${r.n} rows${r.sources ? ` from ${r.sources.length} lists, repeats merged` : ''}${ranked ? ` · ranked by ${by}${show.length < r.items.length ? ` (${r.items.length - show.length} rows show no such number)` : ''}` : ''}${r.ms ? ` · ${secs(r.ms)}` : ''}`));
+        if (sort && !ranked) console.log(`  ${mag('▸')} ${yel(`no row shows a number before "${sort}" — not ranked; read the counts off the rows below`)}`);
+        const top = num(flags.top) || (sort ? 20 : show.length);
+        show.slice(0, top).forEach((it, k) => console.log(`${yel(String(k + 1).padStart(3))}  ${ranked ? bold(String(it.value.toLocaleString()).padStart(11)) + '  ' : ''}${flags.chars ? it.text : trunc(it.text, 220)}${it.href ? `\n${' '.repeat(ranked ? 18 : 5)}${dim(it.href)}` : ''}`));
+        if (show.length > top) console.log(dim(`  … ${show.length - top} more (--top N)`));
+        savedLine(saveLinks(show.map((x) => x.href)));
+        for (const n of r.notes || []) console.log(`  ${mag('▸ note')} ${dim(n)}`);
+        return;
+      }
       console.log(dim(`${r.n} items${r.pages > 1 ? ` across ${r.pages} pages` : ''}`));
       for (const p of r.results) {
         if (r.pages > 1) console.log(dim(`── page ${p.page}  ${p.url}`));
         for (const it of p.items) console.log(`${yel(String(it.i).padStart(3))}${it.ref ? ` ${dim(it.ref)}` : ''}  ${flags.chars ? it.text : trunc(it.text, 160)}${it.href ? `\n     ${dim(it.href)}` : ''}`);
       }
+      savedLine(saveLinks(r.results.flatMap((p) => p.items.map((it) => it.href))));
       return;
     }
 
     case 'sift': {
-      const criterion = args.join(' ');
-      if (!criterion) die(`sift needs a criterion — ${bold('bx sift "groups about home cooking with over 10k members"')}`);
-      const r = await api('POST', '/jev/sift', { criterion, tab: common().tab, max: num(flags.max), target: flags.target, pages: num(flags.pages), all: !!flags.all, chars: num(flags.chars), see: see() });
-      if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }
+      // URLs in the arguments (or --file): open each result list, page it and
+      // judge it, all in this one command, keepers pooled without repeats.
+      const urls = args.filter((x) => /^https?:\/\//i.test(x));
+      if (flags.file) urls.push(...fs.readFileSync(flags.file, 'utf8').split(/\s+/).filter((x) => /^https?:\/\//i.test(x)));
+      const criterion = args.filter((x) => !/^https?:\/\//i.test(x)).join(' ');
+      if (!criterion) die(`sift needs a criterion — ${bold('bx sift "groups about home cooking with over 10k members"')}  ${dim('[<search url> …] --pages N --save keep.txt')}`);
+      if (urls.length > 1 && !flags.json) console.log(dim(`${urls.length} lists · ${num(flags.parallel) === 1 ? 'one after another in bx\'s tab, jev judging each while the next loads' : `${Math.min(num(flags.parallel) || 6, urls.length)} at once in background tabs`}${flags.pages ? ` · up to ${flags.pages} pages each` : ''}`));
+      const r = await api('POST', '/jev/sift', { criterion, urls: urls.length ? urls : undefined, parallel: num(flags.parallel), fresh: !!flags.fresh, budget: urls.length ? (flags.budget === undefined ? 100 : Number(flags.budget)) * 1000 : undefined, tab: common().tab, max: num(flags.max), target: flags.target, pages: num(flags.pages), all: !!flags.all, chars: num(flags.chars), see: see(), sort: typeof flags.sort === 'string' ? flags.sort : undefined });
+      if (flags.json) { const sv = r.ok ? saveLinks(r.items.filter((x) => x.keep).map((x) => x.href)) : null; console.log(JSON.stringify(sv ? { ...r, saved: sv } : r, null, 2)); process.exit(r.ok ? 0 : 1); }
       if (!r.ok) die(r.error || 'sift failed');
+      for (const x of r.sources || []) {
+        if (x?.error) console.log(`${red('err')}  ${trunc(x.url, 80)}  ${dim(trunc(x.error, 60))}`);
+        else if (x?.skipped) console.log(`${yel('skip')} ${trunc(x.url, 80)}  ${dim('out of time — run the same command again')}`);
+        else if (x) console.log(dim(`${String(x.kept).padStart(3)} of ${String(x.n).padEnd(3)} kept · ${x.pages} page${x.pages === 1 ? '' : 's'}${x.cached !== undefined ? ` · cached ${x.cached}s ago` : ''} · ${trunc(x.url, 80)}`));
+      }
       if (r.unjudged) console.log(`${yel('▲ jev could not judge')} ${dim(`(${trunc(r.unjudged, 70)}) — rows marked ?? are unjudged: decide those yourself from their text, do not wait and retry`)}`);
-      console.log(dim(`${r.kept} of ${r.n} kept${r.pages > 1 ? ` across ${r.pages} pages` : ''} · ${secs(r.ms)}`) + eye(r));
+      console.log(dim(`${r.kept} of ${r.n} kept${r.sources ? ` from ${r.sources.length} lists, repeats merged` : r.pages > 1 ? ` across ${r.pages} pages` : ''} · ${secs(r.ms)}`) + eye(r));
       for (const it of r.items) {
         const mark = it.keep === null ? yel('?? ') + ' ' : it.keep ? grn('keep') : dim('drop');
         console.log(`${mark} ${it.keep === null ? dim('  --') : pct(it.keep ? it.p : 1 - (it.p ?? 0))}  ${yel(`${r.pages > 1 ? `p${it.page}·` : ''}${it.i}`.padStart(2))}  ${trunc(it.text, 130)}${it.href ? `\n                ${dim(it.href)}` : ''}`);
       }
+      const sv = saveLinks(r.items.filter((x) => x.keep).map((x) => x.href));
+      savedLine(sv, sv && `bx check "<question>" --file ${sv.file} --save yes.txt`);
+      if (!sv && r.kept > 3 && r.items.some((x) => x.href)) console.log(`  ${mag('▸')} ${dim('add')} ${bold('--save keep.txt')} ${dim('to put the kept links in a file for')} ${bold('bx check "<q>" --file keep.txt')} ${dim('— no script needed')}`);
+      // One search at a time, a model turn each: the many-URL form does them all.
+      if (!urls.length) {
+        const file = path.join(HOME, 'sifts.json');
+        let trail = [];
+        try { trail = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+        const now = Date.now();
+        trail = trail.filter((t) => now - t < 240000).concat(now).slice(-10);
+        try { fs.writeFileSync(file, JSON.stringify(trail)); } catch {}
+        if (trail.length >= 2) console.log(`  ${mag('▸')} ${dim('more searches to go? one command does them all:')} ${bold(`bx sift "${trunc(criterion, 40)}" "<url1>" "<url2>" … --pages N --save keep.txt`)}`);
+      }
+      if (r.skipped?.length) console.log(`  ${mag('▸')} ${bold(`${r.skipped.length} lists left`)} ${dim('— out of time; run the same command with just those URLs')}`);
       process.exit(r.kept || r.unjudged ? 0 : 1);
     }
 
@@ -982,6 +1093,37 @@ async function main() {
       return;
     }
 
+    // ── browsers: which one commands go to ──────────────────────────────
+    case 'use': {
+      if (!args[0]) die(`bx use <n | name | auto>   ${dim('— bx browsers lists them')}`);
+      const r = await api('POST', '/browsers/use', { browser: args[0] });
+      if (!r.ok) die(r.error);
+      const b = r.chosen;
+      console.log(b ? `${OK} commands go to ${bold(b.label ? `${b.browser} "${b.label}"` : b.browser)} ${dim(`(${b.iid}) — bx use auto to undo, --browser for one command`)}` : `${OK} ${bold('auto')} ${dim('— commands go to the browser last in use')}`);
+      return;
+    }
+    case 'browsers': case 'browser': {
+      if (args[0] === 'name' || args[0] === 'label') {
+        if (!args[1]) die('bx browsers name <n> <label>');
+        const r = await api('POST', '/browsers/name', { browser: args[1], label: args.slice(2).join(' ') });
+        if (!r.ok) die(r.error);
+        console.log(`${OK} named`);
+        args.length = 0;
+      } else if (args[0]) {
+        const r = await api('POST', '/browsers/use', { browser: args[0] });
+        if (!r.ok) die(r.error);
+      }
+      const r = await api('GET', '/browsers');
+      if (flags.json) { console.log(JSON.stringify(r, null, 2)); return; }
+      if (!r.browsers.length) die('no browser connected — load extension/ at chrome://extensions');
+      for (const b of r.browsers) {
+        const name = b.label ? `${b.browser} "${b.label}"` : b.browser || 'browser';
+        console.log(`${b.primary ? grn('*') : ' '} ${bold(String(b.n))}  ${name.padEnd(20)} ${dim(`${plural(b.windows, 'window')}, ${plural(b.tabs, 'tab')} · ${b.iid}`)}${b.primary ? grn(b.chosen ? '  ← commands go here (chosen)' : '  ← commands go here (last in use)') : ''}`);
+      }
+      if (r.browsers.length > 1) console.log(dim(`\n  bx use <n>: always that one · bx use auto: the one last in use · --browser <n|name>: one command`));
+      return;
+    }
+
     // ── extensions: which browsers may connect ──────────────────────────
     case 'ext': {
       const sub = args.shift();
@@ -997,7 +1139,7 @@ async function main() {
       if (flags.json) { console.log(JSON.stringify(r, null, 2)); return; }
       console.log(`${bold('connected')}`);
       if (!r.browsers.length) console.log(`  ${dim('none')}`);
-      for (const b of r.browsers) console.log(`  ${(b.browser || '?').padEnd(10)} ${dim(`profile ${b.iid}`)}  ${b.windows ?? '?'} windows, ${b.tabs ?? '?'} tabs${b.primary ? grn('  ← commands go here') : ''}  ${dim(b.ext || '')}`);
+      for (const b of r.browsers) console.log(`  ${(b.browser || '?').padEnd(10)} ${dim(`profile ${b.iid}`)}  ${plural(b.windows, 'window')}, ${plural(b.tabs, 'tab')}${b.primary ? grn('  ← commands go here') : ''}  ${dim(b.ext || '')}`);
       console.log(`${bold('allowed')}`);
       for (const id of r.allowed) console.log(`  ${id}`);
       if (r.refused.length) {

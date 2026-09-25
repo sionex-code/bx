@@ -66,6 +66,9 @@
   .add button { margin: 0; }
   .msg { margin-top: 6px; font-size: 12px; min-height: 1em; }
   .msg.ok { color: var(--ok); } .msg.err { color: #d64545; }
+  .pick { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; cursor: pointer; }
+  #blist input { margin: 0; accent-color: var(--accent); }
+  #blist .here { color: var(--ok); font-size: 11.5px; }
 </style>
 </head>
 <body>
@@ -84,6 +87,11 @@
     <button id="show" hidden>Show bx window</button>
   </main>
   <footer id="foot" hidden>An agent can still use your tab for one command with <code>--here</code>.</footer>
+  <section id="browsers" hidden>
+    <h2>Browsers <small id="bcount"></small></h2>
+    <p>bx is connected in more than one browser. Choose where agents work.</p>
+    <ul id="blist" role="radiogroup" aria-label="Which browser bx commands go to"></ul>
+  </section>
   <section id="jev" hidden>
     <h2>jev <small id="route">…</small></h2>
     <div class="seg" role="radiogroup" aria-label="Which service jev uses">

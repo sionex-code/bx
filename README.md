@@ -420,10 +420,14 @@ in each. There is one bridge per computer, and every browser connects to it:
 - **Keys and settings are shared.** They live in the bridge, so a key added in
   Brave's popup is used by Chrome too, and `bx jev` shows the same list
   everywhere.
-- **Commands go to one browser at a time:** the one with a window open that
-  you used most recently. `bx status` names it, and `bx ext` lists every
-  connected browser and profile. A command about a tab id goes to whichever
-  browser has that tab.
+- **You choose which browser commands go to.** `bx browsers` numbers every
+  connected browser and profile; `bx use 2` (or `bx use brave`) sends every
+  command there from then on, and `--browser <n|name>` sends just one.
+  `bx browsers name 2 work` gives a profile a name you can use instead. The
+  toolbar popup shows the same choice once more than one is connected. With
+  nothing chosen (`bx use auto`), commands go to the browser with a window
+  open that you used most recently. A command about a tab id goes to
+  whichever browser has that tab.
 - **Load the extension from the same folder.** An unpacked extension's id
   comes from its folder path, so the same folder gives the same id in every
   Chromium browser. If you load a copy from somewhere else, it has a different
