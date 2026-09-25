@@ -145,6 +145,40 @@ next page or a scroll brings nothing new. Put the
 criterion the way you would say it to a person, and double-check number
 thresholds yourself (see the recipe above).
 
+**Many lists in one command.** Give `sift` the result URLs themselves and it
+opens each, pages it, judges it and pools the keepers, a group found by two
+searches counted once:
+
+```bash
+bx sift "<criterion>" "<search url 1>" "<search url 2>" … --pages 3 --save keep.txt
+bx sift "<criterion>" --file searches.txt --save keep.txt
+```
+
+The lists load 6 at once in background tabs (`--parallel N`, up to 8), jev
+judging each page as it arrives. A background tab reads pages and follows
+"next" fine but loads no more of an infinite feed, so a feed that needs more
+pages is moved to the front tab by itself and finished there.
+`--parallel 1` runs them one after another in bx's tab. The call stops starting new lists after `--budget` seconds
+(default 100) and names the ones left.
+
+**Recent lists are reused.** A list `items` or `sift` opened by URL is kept
+for 10 minutes, keyed by URL, `--pages`, target and `--chars`. Running either
+command on the same URLs again judges or ranks the kept rows at once instead
+of reloading and scrolling (`cached 40s ago` in the output), which also spares
+the site repeat searches. `--fresh` reloads. The cache lives in the bridge and
+is gone when it restarts.
+
+**`--sort WORD`** (items and sift) ranks rows by the number in front of WORD:
+`574.4K members`, `1,203 reviews`, `2.1M followers`. Rows with no such number
+go last. With `--sort`, `--max N` means "show N" (`--top N` too).
+
+**`--save FILE`** appends links to a file, one per line, never twice: the
+kept rows for `sift`, every row for `items`, the pages answered yes for a
+many-URL `check` (this call's and earlier ones'). Each prints the next
+command to run on that file, so a whole research job chains
+`sift --save keep.txt` → `check --file keep.txt --save yes.txt` →
+`read --file yes.txt` without a script in between.
+
 ### Many pages at once
 
 `bx check` and `bx read` both accept any number of URLs, or `--file` with one
@@ -183,7 +217,7 @@ real text, that answer comes back in about 2s with no tab at all (`fetch` in
 the output). Sites that build the page in JavaScript, like Facebook, send an
 empty shell, so bx remembers the site and renders pages in tabs instead
 (`tab`). `--no-fetch` skips the fetch, and `--parallel N` sets how many pages
-load at once (default 6, max 12; past about 6, Chrome itself is the limit).
+load at once (default 6, max 16; past about 6, Chrome itself is usually the limit).
 
 ### jev can see the page
 
@@ -400,3 +434,292 @@ curl -s localhost:8787/jev/sift  -d '{"criterion":"public groups over 1k members
 
 `/jev/ask` is the raw passthrough: send your own `questions` (`noul`, `choice`,
 `score`) and, with `"page":true`, the current page arrives as the state.
+
+# Moved from SKILL.md
+
+These sections used to be in SKILL.md. They are here in full; SKILL.md keeps the short version.
+
+### Collecting results from a site: the recipe
+
+"Find 10 US fintech companies rated 3.8+ on Trustpilot" and "find LinkedIn
+groups about X" are the same four moves, and none of them is reading pages:
+
+1. **Get to the filtered results with a URL.** Search pages put their
+   filters in the query string. Apply a filter by clicking once if you have
+   to, read the URL it produces (`bx info`), and from then on build the URL
+   yourself: `?query=fintech&trustscore=3.0&location=United+States`. Change
+   the search terms or filters by editing the URL, never by clicking through
+   the filter UI again. Filters with an autocomplete, like a location box,
+   are where a clicking agent burns minutes.
+2. **`bx sift "<criterion>" --pages 5`** reads the list, judges every item,
+   clicks "next" and does it again: one command, a few seconds a page. Use
+   `bx items --pages 5` when you only need the raw rows.
+3. **Check exact numbers yourself.** sift is sound on judgement calls ("a
+   fintech company", "US-based", "an actual business, not a blog") but is
+   only about 90% right on number thresholds like "rated 3.8 or higher". Each
+   row shows the numbers cleanly (`Fintech Crest · fintechcrest.org · 3.9 ·
+   4 · reviews · …`), so read them off the kept rows. Put coarse number filters
+   in the URL where the site has one (`trustscore=3.0`).
+4. **For what the list does not show, check every item in one command:**
+   `bx check "<question>" <url1> <url2> …`. Never open them one by one.
+
+A task that needs 10 results is about 3 commands of yours, not 30.
+
+**Report what the page says, under the page's own label.** If the user asks
+for a field the site does not show (Fiverr publishes review counts, not order
+counts), say it is not available and offer the nearest real field, labelled
+as what it is. Never rename a nearby number to fill the column. When a number
+in `bx items` output has no label, like `4.8 · ( · 26 · )`, check what it is
+on one item's page (`bx read <url>`) before you name the column.
+
+**Big tables: don't retype rows.** Writing out a 50-row table token by token
+is slow. For large results, have a command produce it (`bx items --pages 2
+--json` piped through `jq` or a short script into a file), then show the
+file or the top rows.
+
+Use `bx agent` for navigation hops you cannot express as a URL (add `--read`
+to get the page it lands on). Going back to `bx read` and reading every card
+yourself is the slow path, and it is exactly what jev exists to replace.
+
+Drive by hand only when you already know the exact element, when the flow
+is one action long, or when jev has handed a decision back to you.
+
+
+### The same flow on page after page
+
+Posting in six groups, applying to five jobs, filling the same form on
+several sites: the flow is identical and only the page and the text change.
+Done by hand it is about twelve commands per page. A LinkedIn run spent 11
+minutes posting in six groups that way.
+
+Do it by hand on the first two pages. When the second one finishes, bx
+compares the two and saves the steps they had in common as a recipe. It
+leaves out steps only one page needed, like a popup, and treats buttons that
+name the page ("Join US Stock Market…" and "Join Investment Hub…") as the
+same button:
+
+```
+  ▸ saved  you did the same flow on two pages, so bx kept it as recipe auto-groups
+    nav linkedin.com/groups/12274630 → click "Join" → click text=Start a public post → … → click text=Post
+    every next page, one command: bx recipe auto-groups <url> 'text=…'
+```
+
+From then on each page is one command, under a second of browser time:
+
+```bash
+bx recipe auto-groups https://www.linkedin.com/groups/44059/ 'text=What is one investing idea you wish you had learned earlier?'
+```
+
+If a page differs (an extra welcome dialog, a join that needs approval), the
+recipe stops at the step that failed and says which one. Handle that page by
+hand and carry on with the recipe for the next.
+
+Write each page's text yourself when it should differ. Passing a different
+`text=` per page is the only thing the recipe needs from you.
+
+**Some things a page cannot tell you before you act.** Whether a group lets
+you join without approval only shows after you click Join ("request sent").
+Do not spend `bx check` calls asking; click, and move on if it was a request.
+
+**If the user asks how long it took, do not estimate.** Run `date` when you
+start and when you finish, and report the difference.
+
+
+### Link routes (wiki-walks, "how does A connect to B")
+
+Finding a path of links between two pages is a search, not a puzzle to
+solve in your head. One run spent 2½ minutes guessing bridges from memory
+(Alan Walker → Faded → Sony Music → T-Series …), opened 11 pages, and never
+arrived. Two reads found Alan Walker → Vishal Mishra → Atif Aslam in ~10s:
+
+```bash
+bx read --mode links --max 5000 "https://en.wikipedia.org/wiki/Alan_Walker" > out.txt   # every link on A
+bx read --mode links --max 5000 "https://en.wikipedia.org/wiki/Special:WhatLinksHere/Atif_Aslam?limit=5000" > in.txt   # every page linking to B
+# article names in both lists = a 2-hop route (A → X → B)
+```
+
+Extract the article names with a short script: keep the `/wiki/Name` part,
+drop names containing `:` (Special:, File:, Help:…) and `Main_Page`. Then
+intersect the two lists.
+
+- No overlap: take A's out-links, then run
+  `bx check "does this page link to <B>?" <url> <url> …` on them all at once.
+  A yes gives you A → X → Y → B. Never open them one by one.
+- `--mode links` stops at 300 links unless you pass `--max`. On Wikipedia,
+  always pass `--max 5000`.
+- `bx read --mode links --max 5000 <url> <url> …` lists the links of many
+  pages at once, one level deeper in a single command.
+- `bx read` (markdown) starts at the top of the page, which on Wikipedia
+  means menus. Scrolling does not change that. Use `--mode links` to see
+  what a page links to, not `read` + `eval`.
+
+#### A live race (click in real time, no background reads)
+
+When the user wants to watch the browser click through, walk it yourself.
+You choose each hop. jev is poor at "which link is closer to B": asked
+for that, `bx pick` returns `found nothing matching` or picks a citation
+like `[8]`, and `bx agent` goes India → Maldives → Asia. Each hop is two
+commands, about 3s in total:
+
+```bash
+bx read --mode links --max 5000 | grep -iE "pakistan|punjab|gujrat"   # what this page offers
+bx click 'a[href$="/Punjab,_Pakistan"]'                               # exact link, found even if offscreen
+```
+
+- Plan the route from what you know (A → country → region → B), and grep
+  each page for the next step's words. Don't scroll + `els | grep` to find
+  links: `els` only lists what is near the screen, and `bx els "<a|b>"`
+  takes CSS, not text.
+- Click by the link's address, not `text=`. `text=India` matches "Warner
+  Music India", and `text=Mumbai` hit the city's coat of arms and opened
+  the image viewer.
+- Wikipedia link text and the target differ. On Punjab, Pakistan, "Gujrat"
+  goes to `/Gujrat_Division`, and "Gujarat" is the Indian state. Take the
+  `href` from the grep line, and confirm the end page with
+  `bx check "is this about <B>"`.
+- Never type into the search box or click the logo in a race. `bx agent`
+  with "link by link" or "no search" in the goal is limited to article
+  links for the same reason.
+
+
+### Rule 1 — batch everything
+
+Every action is a network round trip. Put the whole sequence in one `bx do`.
+Actions run in order, share one tab, and stop at the first failure.
+
+```bash
+bx do '[
+  {"a":"nav","url":"example.com/login"},
+  {"a":"fill","fields":{"#user":"me","#pass":"secret"}},
+  {"a":"click","target":"text=Log in"},
+  {"a":"wait","for":"text=Dashboard"},
+  {"a":"shot"}
+]'
+```
+
+Add `--keepgoing` to continue past failures instead of stopping.
+
+A batch is bounded: each action gets its timeout plus a few seconds, and typing
+gets extra room proportional to the text. Nothing hangs indefinitely — if a
+command has not returned, it is still working.
+
+### Rule 2 — never wait manually
+
+Every element action auto-waits for its target (default 8s). Do not insert
+`wait` before a `click`. Only use `wait` for things that are not a target:
+`{"a":"wait","for":"text=Done"}`, `{"a":"wait","gone":".spinner"}`,
+`{"a":"wait","text":"Payment received"}`, `{"a":"wait","ms":400}`.
+
+A miss costs the full 8s, so when you are probing rather than acting — checking
+whether a banner is up, whether login already happened — pass a short timeout
+and read the answer: `{"a":"exists","target":".cookie-banner","timeout":300}`.
+`exists` never fails; it returns `{"exists":false}`.
+
+### Rule 3 — orient with `els`, not screenshots
+
+`bx els` returns a compact list of every visible interactive element with a
+stable `ref`. It is far cheaper than an image and directly actionable.
+
+```
+e3    button   Sign in                       412,318
+e4    input    Email address                 412,240
+```
+
+Then `bx click ref=e3`. Take a screenshot only when the *look* matters,
+or when `els` and `read` leave you genuinely unsure what is on screen.
+
+A ref names one element in one render. Apps like LinkedIn and Gmail rebuild
+their lists after every action. When that happens bx re-finds the element
+by its tag and text and says so (`ref e158 was stale, re-found by its text
+as e170`). When it cannot be sure, it fails at once with the text to target
+instead (`target it as text=…`). Either way you do not need another
+`bx els` between clicks. `text=` targets survive re-renders, so prefer them
+for anything you click more than once.
+
+
+### Rule 4 — bx remembers each site; read what it hands you
+
+Every batch teaches the bridge something about the host it ran on: which
+selectors resolved, which missed, what the working sequence was. You get it
+back **unasked** — a `memory` block prints when you arrive at a site and
+whenever an action fails.
+
+```
+  ▸ memory fiverr.com
+    url     /search/gigs?ref=seller_location%3APK ("Apply")
+    works   text=Seller details · text=Apply · text=Pakistan
+    note    Seller country: ref=seller_location%3APK (ISO code); country=Pakistan does nothing.
+```
+
+Act on it before you probe. `url` is a filter, sort or search that a past
+click turned into a URL parameter: put it straight into `bx open` and skip
+the dropdowns. `works` is a selector that resolved here for real; `avoid`
+already cost someone the full 8s timeout. A `recipe` is the whole flow in one
+command.
+
+**Save what you solved, in one line.** bx records `url` parameters and
+working selectors by itself, so do not note those. The moment you work out
+something bx cannot see, like a trap, a hidden rule, a field the site does not
+publish, or the page that actually has the data, save it as a single line:
+
+```bash
+bx note "Orders are not public; the (N) on cards is reviews."
+bx note "Search needs login; logged out it shows 10 results and stops."
+```
+
+Notes over 160 characters are refused. Every note is printed on every future
+visit, so write the one fact, not the story. Save it when you solve it, not
+at the end of the task.
+
+```bash
+bx memo [host]              # ask directly — everything known about a site
+bx memo --all               # every site bx has driven
+bx recipe search 'q=…'      # replay a stored flow
+bx learn <name>             # name the flow you just ran, so it is one command next time
+bx note "<one line>"        # a fact a selector or URL cannot express, ≤160 chars
+bx forget <what> [host]     # all | notes | traces | traps | selectors | recipe <name>
+```
+
+bx saves a flow you repeat on two pages of the same kind by itself (see "The
+same flow on page after page"). Everything else is up to you.
+
+**Do this:** the moment a flow that took real work finally succeeds — a login,
+a multi-step form, a search that needed the right field — run `bx learn <name>`.
+That is the whole point: struggle once, then never again.
+
+If you drove the flow one command at a time, no single batch holds it. `bx
+learn` then prints your recent actions, numbered from the newest. Run `bx
+learn <name> --last N` to keep the last N of them. Steps you took through a
+`ref=` are stored under the durable selector they actually hit, so the
+recipe still works after the page re-renders.
+
+A recipe that has failed every run is marked `broken` in the memory block,
+and `bx recipe` refuses to replay it (`--force` overrides). Redo the flow and
+`bx learn` it again under the same name.
+
+Acting through `ref=e12` still teaches it something. Every element action
+reports the durable selector it actually landed on (`sel` in the result), and
+that is what gets stored — refs are per-snapshot and never remembered.
+
+Typed text is never written to disk. A stored flow keeps the shape and leaves a
+named hole where the value went, so `bx recipe login 'user=me' 'password=…'`
+supplies them at replay time. Memory lives in `~/.bx/memory/<host>.json`.
+
+## Several browsers
+
+bx loaded in Chrome, Brave, Edge or several profiles connects from each, all
+to one bridge.
+
+```bash
+bx browsers                  # numbered: 1 Brave, 2 Chrome …   * = where commands go
+bx use 2                     # from now on (also: bx use brave, bx use <profile id>)
+bx use auto                  # the browser with a window, used most recently (the default)
+bx open x.com --browser 1    # one command only; works on every command
+bx browsers name 2 work      # a name for a profile: bx use work
+```
+
+Every request made by one command, including background reads and jev's page
+looks, goes to the same browser. A chosen browser that is not connected right
+now falls back to auto rather than failing. Over HTTP, send the header
+`x-bx-browser: <n|name>` or `"browser"` in a `/do` body. The toolbar popup
+shows a picker once two are connected.

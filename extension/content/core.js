@@ -19,7 +19,19 @@ BX.prof = (s) => {
   return BX.PROFILES[s || BX.cfg.speed] || BX.PROFILES.fast;
 };
 
-BX.sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
+// A hidden page's timers fire at most once a second, and bx's own window is
+// hidden whenever the user's windows cover it: a 50ms setTimeout took 997ms,
+// so every settle wait cost a second. The service worker's timers are not
+// throttled and a message is not a timer, so a hidden page has the worker
+// keep time for it. Whichever of the two answers first wins.
+BX.sleep = (ms) => {
+  if (!(ms > 0)) return Promise.resolve();
+  if (document.visibilityState !== 'hidden') return new Promise((r) => setTimeout(r, ms));
+  return new Promise((r) => {
+    const t = setTimeout(r, ms);
+    try { chrome.runtime.sendMessage({ t: 'bx-sleep', ms: Math.min(ms, 30000) }, () => { void chrome.runtime.lastError; clearTimeout(t); r(); }); } catch {}
+  });
+};
 BX.gauss = () => {
   let u = 0, v = 0;
   while (u === 0) u = Math.random();

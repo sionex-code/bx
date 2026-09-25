@@ -324,6 +324,20 @@ async function jevBrain(ctx, cfg, image) {
   let target = { value: null, confidence: 1, ranked: [] };
   if (pool) target = pool.length === 1 ? { value: pool[0].ref, confidence: 1, ranked: [] } : a(`${verb}_target`);
   const ref = pool && pool.some((e) => e.ref === target.value) ? target.value : null;
+  // Two search boxes, or a result's title and its thumbnail linking to the
+  // same page, split jev's vote between elements that do the same thing, and
+  // the run stopped "unsure" at 0.56 with 78% on one search box and 22% on the
+  // other. Votes for equivalent elements count together.
+  if (ref && pool.length > 1 && target.confidence < cfg.min_confidence) {
+    const byRef = new Map(pool.map((e) => [e.ref, e]));
+    const me = byRef.get(ref);
+    const same = (e) => !!e && e !== me && (
+      (me.href && e.href && bare(e.href) === bare(me.href)) ||
+      (verb === 'type' && searchy(me) && searchy(e)) ||
+      (e.tag === me.tag && clean(e.name, 70).toLowerCase() === clean(me.name, 70).toLowerCase() && !!me.name && e.where === me.where));
+    const p = (target.p ?? 0) + (target.ranked || []).filter((x) => x.label !== ref && same(byRef.get(x.label))).reduce((n, x) => n + x.p, 0);
+    if (p >= 0.85) target = { ...target, confidence: Math.max(target.confidence, p), merged: true };
+  }
   const pick = ctx.candidates.find((c) => c.v === text.value) || ctx.candidates[0];
   const done = (verb === 'done' && op.confidence >= cfg.min_confidence) || (ctx.step > 1 && fin.p >= (cfg.done_p ?? 0.8));
   const blocked = verb === 'blocked' && op.confidence >= cfg.min_confidence;
@@ -510,8 +524,15 @@ async function run(o, deps) {
     const byRef = new Map(ctx.elements.map((e) => [e.ref, e]));
     const el = d.target ? byRef.get(d.target) : null;
 
-    const aim = el ? (el.sel || (el.name ? `text=${clean(el.name, 60)}` : `ref=${el.ref}`)) : null;
-    const spare = el ? (el.sel && el.name ? `text=${clean(el.name, 60)}` : `ref=${el.ref}`) : null;
+    // A text= selector is never checked for being unique, and on a search
+    // results page "text=Alan Turing" matched fourteen things, the first of
+    // them the search box holding that query: the agent clicked the box and
+    // thought it had opened the article. So a text= handle aims by the ref
+    // jev chose (bx re-finds a stale one by its text) and keeps the text as
+    // the fallback; CSS handles are unique by construction.
+    const weak = (x) => !x || x.startsWith('text=');
+    const aim = el ? (weak(el.sel) ? `ref=${el.ref}` : el.sel) : null;
+    const spare = el ? (weak(el.sel) ? (el.sel || (el.name ? `text=${clean(el.name, 60)}` : null)) : el.name ? `text=${clean(el.name, 60)}` : `ref=${el.ref}`) : null;
 
     // Already holds exactly what we were going to type: submit it instead of
     // typing it again, which is the shape most loops get stuck in.
@@ -619,7 +640,15 @@ async function run(o, deps) {
         const s1 = await deps.exec({ ...common, stopOnError: false, actions: [
           { a: 'after', from: url, ms: d.verb === 'type' ? 400 : cfg.settle_ms ?? 250, timeout: 6000 }
         ] });
-        const u = s1.results?.[0]?.r?.url || s1.url;
+        let u = s1.results?.[0]?.r?.url || s1.url;
+        // Typed and pressed Enter, and nothing moved: the Enter was eaten by
+        // an autocomplete. Submit the field's form directly, once.
+        if (d.verb === 'type' && d.enter && !s1.results?.[0]?.r?.moved) {
+          const s2 = await deps.exec({ ...common, stopOnError: false, actions: [
+            { a: 'submit', target: aim }, { a: 'after', from: url, ms: 400, timeout: 6000 }
+          ] });
+          if (s2.results?.[0]?.r?.via === 'form') { rec.acted.submitted = true; u = s2.results?.[1]?.r?.url || s2.url || u; }
+        }
         if (u) out.url = u;
       } catch {}
     }

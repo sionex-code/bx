@@ -7,6 +7,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
 const { handleUpgrade } = require('./ws');
 const mem = require('./memory');
 const jev = require('./jev');
@@ -23,6 +24,10 @@ const DEFAULTS = {
   // trusted on its own; any other (bx loaded from a second folder, in another
   // browser) waits until `bx ext allow <id>`.
   extension_ids: [],
+  // Which connected browser commands go to: a profile's iid, or null for
+  // "the one last in use". Names are labels the user gave a profile.
+  browser: null,
+  browser_names: {},
   speed: 'fast',        // instant | fast | human
   trusted: false,       // force CDP-trusted input for every click/type
   timeout: 8000,
@@ -126,6 +131,46 @@ function primary() {
   return best;
 }
 const connected = () => exts.size > 0;
+
+// ── which browser ────────────────────────────────────────────────────────
+// Every request carries the browser it wants (the CLI's --browser, sent as a
+// header), and everything the request does underneath — reads, snaps, jev
+// look-ups — goes to that same browser without each helper passing it on.
+const scope = new AsyncLocalStorage();
+
+// Connected browsers in a stable order, so "2" means the same one from one
+// command to the next: by name, then by profile id.
+function browsers() {
+  return [...exts.entries()].map(([ws, m]) => ({ ws, m, name: browserName(m) || 'browser', label: (m.iid && CFG.browser_names[m.iid]) || null }))
+    .sort((a, b) => a.name.localeCompare(b.name) || String(a.m.iid).localeCompare(String(b.m.iid)));
+}
+
+// A number from `bx browsers`, a label, a browser name (brave, edge) or the
+// start of a profile id.
+function findBrowser(spec) {
+  const s = String(spec ?? '').trim().toLowerCase();
+  if (!s) return null;
+  const list = browsers();
+  if (/^\d+$/.test(s)) return list[Number(s) - 1] || null;
+  return list.find((x) => x.m.iid && x.m.iid.toLowerCase().startsWith(s))
+    || list.find((x) => x.label && x.label.toLowerCase() === s)
+    || list.find((x) => x.name.toLowerCase() === s)
+    || list.find((x) => `${x.name} ${x.label || ''}`.toLowerCase().includes(s)) || null;
+}
+
+// The socket a command goes to: the browser this request named, else the
+// one chosen with `bx use`, else the one last in use. A chosen browser that
+// is closed right now falls back rather than failing every command.
+function destination(want) {
+  want = want ?? scope.getStore()?.browser;
+  if (want && want !== 'auto') {
+    const hit = findBrowser(want);
+    if (!hit) throw new HttpError(404, `no connected browser matches "${want}" — connected: ${browsers().map((x, i) => `${i + 1} ${x.label || x.name}`).join(', ') || 'none'}`);
+    return hit.ws;
+  }
+  const sticky = CFG.browser && findBrowser(CFG.browser);
+  return sticky ? sticky.ws : primary();
+}
 const broadcast = (s) => { for (const ws of exts.keys()) { try { ws.send(s); } catch {} } };
 
 // Chrome may have torn the extension's service worker down for being idle; it
@@ -170,7 +215,7 @@ function callOn(ws, payload, timeoutMs) {
 function call(payload, timeoutMs) {
   const tab = payload.tab;
   const pinned = tab !== undefined && tab !== 'active' && tab !== 'current';
-  const first = typeof tab === 'number' && exts.has(owner.get(tab)) ? owner.get(tab) : primary();
+  const first = typeof tab === 'number' && exts.has(owner.get(tab)) ? owner.get(tab) : destination();
   if (!first) return Promise.reject(new Error('extension not connected'));
   // A tab named by id or by a piece of its title may live in another profile
   // this bridge has not heard about yet: ask the others before giving up.
@@ -280,15 +325,25 @@ async function askSeeing(b, st, qs, over, weak, about) {
 // Read the list on this page, then follow "next" up to `pages` pages. Each
 // page is handed to `onPage` the moment it is read, so a caller can judge
 // page 1 while page 2 loads.
-async function collect(b, onPage) {
+//
+// A background tab reads pages and follows pagers fine but does not load a
+// feed's next batch when scrolled. With `b.bg`, collect stops at the first
+// scroll and returns what it has with `.resume` set; collect(b, onPage,
+// pages.resume) in the front tab carries on from there.
+async function collect(b, onPage, from) {
   if (b.items) return [];
   const tab = b.tab ?? 'active';
   const want = Math.max(1, Math.min(Number(b.pages) || 1, 20));
-  const out = [];
-  const seen = new Set();
-  const seenHref = new Set();
-  let feed = false;
-  for (let n = 1; n <= want; n++) {
+  const out = from ? from.out : [];
+  const seen = from ? from.seen : new Set();
+  const seenHref = from ? from.seenHref : new Set();
+  let feed = !!from;
+  if (from) {
+    delete out.resume;
+    const moved = await runBatch({ tab, memory: false, stopOnError: false, actions: [{ a: 'scrollend' }] });
+    if (!moved.results[0]?.ok) return out;
+  }
+  for (let n = from ? from.n + 1 : 1; n <= want; n++) {
     // On a feed every scroll leaves the earlier items in place, so the list
     // keeps growing; read enough of it to reach the new ones.
     const cap = (b.max || 40) * (feed ? n : 1);
@@ -298,20 +353,37 @@ async function collect(b, onPage) {
     for (let tries = 0; tries < (feed ? 4 : 1); tries++) {
       if (tries) await new Promise((ok) => setTimeout(ok, 700));
       look = await runBatch({ tab, memory: false, stopOnError: false, actions: [
-        { a: 'wait', settle: true, timeout: 4000 },
-        { a: 'items', target: b.target, max: cap, chars: b.chars || 400 },
+        // Short: feeds like Facebook never go quiet, so this used to run to
+        // its full 4s on every list. A list that is not there yet is waited
+        // for below, a second at a time.
+        { a: 'wait', settle: true, quiet: 250, timeout: 1500 },
+        { a: 'items', target: b.target, max: cap, chars: b.chars || 400, timeout: b.target ? 3000 : 1500 },
         ...(n < want ? [{ a: 'nextpage' }] : [])
       ] });
       r = look.results[1];
       if (!feed || !r?.ok || (r.r.items || []).some((x) => x.href && !seenHref.has(x.href))) break;
     }
+    // A target that is not on the page will not appear by waiting: an agent
+    // passed 'role=link --has members' as the list and the retries below,
+    // each waiting out the full 8s target timeout, held it for 85 seconds.
+    if (n === 1 && !r?.ok && b.target && /not found/i.test(String(r?.error))) {
+      throw new HttpError(404, `"${b.target}" is not on this page — run bx items with no target to find the list by itself${/\s--/.test(b.target) ? ' (flags go outside the quotes)' : ''}`);
+    }
     // Apps fill their lists in after the page reports loaded: LinkedIn's
     // inbox showed its conversations ~4s after `bx open` returned, and a
-    // single read in that window found no list and gave up.
-    for (let late = 0; n === 1 && late < 8 && (!r?.ok || !r.r.items?.length); late++) {
+    // single read in that window found no list and gave up. Five seconds at
+    // most, and not at all once the page says it has nothing: Facebook shows
+    // "We didn't find any results" when it throttles repeated searches.
+    // Later pages of a pager are fresh page loads too, and as slow to fill.
+    for (let late = 0; (n === 1 || !feed) && late < 5 && (!r?.ok || !r.r.items?.length); late++) {
+      if (late === 0) {
+        const none = await noResults(tab);
+        if (none && n > 1) break;              // ran off the end of the results
+        if (none) throw new HttpError(404, `the page says "${none}" — no list to read. If searches worked a minute ago, the site is throttling you: wait ~30s or use a different query`);
+      }
       await new Promise((ok) => setTimeout(ok, 1000));
       look = await runBatch({ tab, memory: false, stopOnError: false, actions: [
-        { a: 'items', target: b.target, max: cap, chars: b.chars || 400 },
+        { a: 'items', target: b.target, max: cap, chars: b.chars || 400, timeout: 800 },
         ...(n < want ? [{ a: 'nextpage' }] : [])
       ] });
       look.results.unshift(null);   // keep the [wait, items, nextpage] shape
@@ -334,17 +406,32 @@ async function collect(b, onPage) {
     if (!fresh.length && feed) break;          // scrolled and nothing new came in
     if (nx.none && !nx.feed) break;
     if (nx.none) feed = true;
-    const step = feed ? { a: 'scrollend' } : nx.href ? { a: 'nav', url: nx.href } : { a: 'click', target: nx.sel };
+    if (feed && b.bg) { out.resume = { n, out, seen, seenHref }; return out; }
+    // The same room as the first page's load: with the action default, the
+    // next page of a script-heavy site (8-12s in a background tab) timed out
+    // and the list quietly ended at page one.
+    const step = feed ? { a: 'scrollend' } : nx.href ? { a: 'nav', url: nx.href, timeout: 20000 } : { a: 'click', target: nx.sel };
     const moved = await runBatch({ tab, memory: false, stopOnError: false, actions: [step] });
     if (!moved.results[0]?.ok) break;
   }
   return out;
 }
 
+// The page's own "nothing here" notice, if it shows one.
+const NONE = /(we (?:didn'?t|did not|couldn'?t|could not) find any(?: results)?|no results? (?:found|for)|nothing (?:was )?found|0 results|no matches|did not match any)/i;
+async function noResults(tab) {
+  try {
+    const t = (await runBatch({ tab, memory: false, stopOnError: false, actions: [{ a: 'read', mode: 'text', max: 4000 }] })).results[0]?.r?.text || '';
+    const m = NONE.exec(t);
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+
 // One page of items, one jev call: a yes/no per item. The criterion lives in
 // the state and each item's text lives in its own question — putting the list
 // in the state as well sent every item twice, and made sift the slowest call.
-async function judge(b, page) {
+const judge = (b, page) => judgeList(b, page);
+async function judgeList(b, page) {
   const items = (page.items || []).map((x, i) => (typeof x === 'string' ? { i, text: x } : { i: x.i ?? i, ...x }));
   if (!items.length) return [];
   const st = `PAGE: ${page.title || ''} — ${page.url || ''}\n\nEACH QUESTION IS ONE ITEM FROM A LIST ON THIS PAGE, TO BE JUDGED AGAINST THIS CRITERION:\n${b.criterion}\n\nJudge only from the item's own text. Numbers matter: a rating or a count in the text is exact.`;
@@ -382,6 +469,214 @@ async function judge(b, page) {
     const a = jev.read(answers[`i${x.i}`]);
     return { ...x, keep: !!a.value, p: a.p, saw, model };
   });
+}
+
+// ── many result lists, one command ───────────────────────────────────────
+// "One search per phrase, then sift each" was a model turn per phrase, plus
+// a script to pool the keepers. Here every search URL is opened, paged and
+// judged in one call, LIST_PAR lists at once in background tabs; jev judges
+// each page while the next one loads. A feed that must be scrolled for more
+// is finished in the front tab, the only one Chrome loads more feed into.
+// --parallel 1 reads them one after another in bx's tab instead.
+// Without a criterion it is `bx items` over many lists: every row kept.
+const keepAll = async (b, page) => (page.items || []).map((x) => ({ ...x, keep: true }));
+
+// "The biggest group", "the most reviewed": rank rows by the number in front
+// of a word ("574.4K members", "1,203 reviews", "2.1M followers"). A model
+// eyeballing forty rows for the largest number is slow and misreads K and M.
+//
+// Review sites mostly print the count bare in brackets after the rating,
+// "4.9 (115)", "★ 4.7 (1k+)", with no word at all. When no row has the word,
+// the bracketed number ranks them instead, and `by` says so.
+const BRACKET = /\(\s*(?:·\s*)?(\d[\d,.]*)\s*([KkMmBb])?\+?\s*(?:·\s*)?\)/;
+function sortBy(items, word) {
+  if (!word || word === true) return items;
+  const w = String(word).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const val = (re) => (t) => {
+    const m = re.exec(String(t || ''));
+    if (!m) return null;
+    const n = parseFloat(m[1].replace(/,/g, ''));
+    return isNaN(n) ? null : Math.round(n * ({ k: 1e3, m: 1e6, b: 1e9 }[String(m[2] || '').toLowerCase()] || 1));
+  };
+  const rank = (f) => items.map((x) => ({ ...x, value: f(x.text) })).sort((a, b) => (b.value ?? -1) - (a.value ?? -1));
+  const out = rank(val(new RegExp(`(\\d[\\d,.]*)\\s*([KkMmBb])?\\+?\\s*${w}`, 'i')));
+  if (out.some((x) => x.value != null)) return out;
+  const alt = rank(val(BRACKET));
+  return alt.some((x) => x.value != null) ? alt.map((x) => ({ ...x, by: 'brackets' })) : out;
+}
+
+// Lists read in the last ten minutes, by URL and how they were read. Asking
+// the same searches again — a follow-up question, another criterion, a retry
+// after a model misread the output — was a full reload and scroll of every
+// list each time, and repeated searches are what gets Facebook to throttle.
+const LISTS = new Map();
+const LIST_TTL = 10 * 60e3;
+// Lists read at once. A background tab spends most of a load waiting, so more
+// tabs help (8 search lists: 54s four at once, 32s eight); 6 spares the site.
+const LIST_PAR = 6;
+// Not keyed on --max: items and sift cap rows differently, and a list read by
+// one should serve the other.
+const listKey = (u, b) => JSON.stringify([u, Math.max(1, Math.min(Number(b.pages) || 1, 20)), b.target || '', b.chars || 400]);
+
+async function siftMany(b, urls) {
+  const judge = b.criterion ? judgeList : keepAll;
+  const t0 = Date.now();
+  const all = urls;
+  const sourcesAll = new Array(all.length);
+  const judgingAll = [];
+  // Cached lists are judged straight away; only the rest are opened.
+  if (!b.fresh) {
+    for (const [k, v] of LISTS) if (t0 - v.at > LIST_TTL) LISTS.delete(k);
+    const miss = [];
+    all.forEach((u, i) => {
+      const hit = LISTS.get(listKey(u, b));
+      if (!hit) { miss.push(i); return; }
+      const got = Promise.all(hit.pages.map((page) => judge(b, page).then((xs) => xs.map((x) => ({ ...x, from: u }))))).then((x) => x.flat());
+      judgingAll.push(got);
+      sourcesAll[i] = got.then((xs) => ({ url: u, pages: hit.pages.length, n: xs.length, kept: xs.filter((x) => x.keep).length, cached: Math.round((t0 - hit.at) / 1000) }));
+    });
+    if (miss.length < all.length) {
+      const sub = miss.length ? await siftMany({ ...b, fresh: true, _inner: true }, miss.map((i) => all[i])) : { sources: [], raw: [] };
+      miss.forEach((i, k) => { sourcesAll[i] = sub.sources[k]; });
+      const judged = [...(await Promise.all(judgingAll)).flat(), ...sub.raw];
+      return finishMany(b, await Promise.all(sourcesAll), judged, t0);
+    }
+  }
+  return siftFresh(b, urls, judge, t0);
+}
+
+async function siftFresh(b, urls, judge, t0) {
+  // Several lists: LIST_PAR background tabs at once, unless the caller asked
+  // for --parallel 1 (one after another in bx's tab).
+  const asked = Number(b.parallel) || 0;
+  const par = Math.max(1, Math.min(asked || (urls.length > 1 ? LIST_PAR : 1), 8));
+  const deadline = b.budget ? t0 + Number(b.budget) : Infinity;
+  const sources = new Array(urls.length);
+  const judging = [];
+  let next = 0;
+  const close = (id) => { if (typeof id === 'number') runBatch({ memory: false, actions: [{ a: 'closetab', id }] }).catch(() => {}); };
+  const finish = (u, i, pages, mine) => {
+    if (pages.length) LISTS.set(listKey(u, b), { at: Date.now(), pages: pages.map((p) => ({ ...p, tab: undefined })) });
+    return Promise.all(mine).then((x) => {
+      const got = x.flat();
+      sources[i] = { url: u, pages: pages.length, n: got.length, kept: got.filter((y) => y.keep).length };
+    });
+  };
+  // Returns the list's state when, in a background tab, it turned out to be
+  // a feed that needs scrolling: the caller finishes it in the front tab.
+  const one = async (u, i, tab, loaded, bg) => {
+    const go = () => runBatch({ tab, memory: false, stopOnError: false, actions: [{ a: 'nav', url: u, timeout: 20000 }] });
+    let opened = loaded ? { results: [{ ok: true }] } : await go();
+    // A single failed load is usually a blip; a second one is the site
+    // refusing, and gets reported.
+    if (!opened.results[0]?.ok && /failed to load/i.test(String(opened.results[0]?.error))) {
+      await new Promise((ok) => setTimeout(ok, 1500));
+      opened = await go();
+    }
+    if (!opened.results[0]?.ok) { sources[i] = { url: u, error: opened.results[0]?.error || 'could not open' }; return; }
+    let pages = [];
+    const mine = [];
+    const onPage = (page) => { const p = judge({ ...b, tab }, page).then((xs) => xs.map((x) => ({ ...x, from: u }))); mine.push(p); judging.push(p); };
+    try {
+      pages = await collect({ ...b, tab, bg }, onPage);
+    } catch (e) { sources[i] = { url: u, error: String(e.message || e) }; return; }
+    if (pages.resume && Date.now() < deadline) return { u, i, tab, pages, mine, onPage };
+    await finish(u, i, pages, mine);
+  };
+  if (par === 1 && urls.length > 1) {
+    // One at a time, but never waiting on the network: while one list is
+    // scrolled in the front tab, the next ones load in background tabs and
+    // are brought to the front when their turn comes. (Lending the front tab
+    // to every list in turn, scroll by scroll, was measured slower: a page
+    // brought back to the front re-renders first, and each scroll then cost
+    // 2-4s instead of under one.)
+    const home = (await runBatch({ tab: b.tab ?? 'active', memory: false, actions: [{ a: 'info' }] })).tab;
+    const open = (u) => runBatch({ memory: false, stopOnError: false, actions: [{ a: 'newtab', url: u, active: false, wait: false }] })
+      .then((o) => o.results[0]?.r?.id ?? null).catch(() => null);
+    // Two lists loading ahead: one was not enough, a list scrolled in 5s
+    // while the next still had a second of its 6s load to go.
+    const AHEAD = 2;
+    const pre = new Map();
+    for (let k = 1; k <= AHEAD && k < urls.length; k++) pre.set(k, open(urls[k]));
+    for (let i = 0; i < urls.length; i++) {
+      if (i + AHEAD < urls.length && i > 0) pre.set(i + AHEAD, open(urls[i + AHEAD]));
+      if (Date.now() > deadline) { sources[i] = { url: urls[i], skipped: true }; continue; }
+      const mine = i === 0 ? null : await pre.get(i);
+      pre.delete(i);
+      if (mine === null) { await one(urls[i], i, home); continue; }
+      try {
+        await runBatch({ memory: false, stopOnError: false, actions: [{ a: 'tab', id: mine }, { a: 'wait', load: true, timeout: 20000 }] });
+        await one(urls[i], i, mine, true);
+      } finally { close(mine); }
+    }
+    for (const p of pre.values()) close(await p);
+    // bx's own tab is the one it was working in before.
+    if (typeof home === 'number') { try { await runBatch({ memory: false, actions: [{ a: 'tab', id: home }] }); } catch {} }
+  } else if (par === 1) {
+    await one(urls[0], 0, b.tab ?? 'active');
+  } else {
+    // Background tabs, `par` at once: a hidden tab loads, reads and follows a
+    // pager as well as the front one, and several load side by side (4 search
+    // lists: 60s one after another, 30s four at once). The one thing a hidden
+    // tab cannot do is load a feed's next batch on scroll, so a feed that
+    // wants more pages is handed, tab and all, to the front, one at a time,
+    // while the other lists carry on loading.
+    let home;
+    let front = Promise.resolve();
+    const inFront = async (st) => {
+      try {
+        if (home === undefined) home = (await runBatch({ tab: b.tab ?? 'active', memory: false, actions: [{ a: 'info' }] })).tab;
+        await runBatch({ memory: false, actions: [{ a: 'tab', id: st.tab }] });
+        const pages = Date.now() < deadline ? await collect({ ...b, tab: st.tab }, st.onPage, st.pages.resume) : st.pages;
+        await finish(st.u, st.i, pages, st.mine);
+      } catch (e) { await finish(st.u, st.i, st.pages, st.mine); } finally { close(st.tab); }
+    };
+    await Promise.all(Array.from({ length: Math.min(par, urls.length) }, async () => {
+      let tab = null;
+      try {
+        while (next < urls.length) {
+          const i = next++;
+          if (Date.now() > deadline) { sources[i] = { url: urls[i], skipped: true }; continue; }
+          if (tab === null) {
+            const t = await runBatch({ memory: false, actions: [{ a: 'newtab', url: 'about:blank', active: false }] });
+            tab = t.results[0]?.r?.id ?? t.tab;
+          }
+          const st = await one(urls[i], i, tab, false, true);
+          if (st) { front = front.then(() => inFront(st)); tab = null; }
+        }
+      } finally { close(tab); }
+    }));
+    await front;
+    if (typeof home === 'number') { try { await runBatch({ memory: false, actions: [{ a: 'tab', id: home }] }); } catch {} }
+  }
+  const raw = (await Promise.all(judging)).flat();
+  if (b._inner) return { sources, raw };
+  return finishMany(b, sources, raw, t0);
+}
+
+function finishMany(b, sources, raw, t0) {
+  const urls = sources.map((x) => x?.url);
+  // One entry, one row: the same group turns up under several searches.
+  const byKey = new Map();
+  for (const x of raw) {
+    const k = x.href || x.text;
+    const had = byKey.get(k);
+    if (!had || (x.keep && !had.keep) || (x.keep === had.keep && (x.p ?? 0) > (had.p ?? 0))) byKey.set(k, x);
+  }
+  const judged = [...byKey.values()];
+  const kept = judged.filter((x) => x.keep).sort((x, y) => (y.p ?? 0) - (x.p ?? 0));
+  const unjudged = judged.filter((x) => x.keep === null);
+  // The site's notes ride along: these reads run with memory off, so the
+  // briefing a `bx open` would have printed never showed.
+  const notes = (mem.digest(mem.hostOf(urls[0]) || '') || {}).notes;
+  return {
+    ok: true, criterion: b.criterion, sources, pages: sources.reduce((n, x) => n + (x?.pages || 0), 0),
+    ...(notes ? { notes: notes.slice(0, 3) } : {}),
+    ...(unjudged.length ? { unjudged: `${unjudged.length} items: ${unjudged[0].unjudged}` } : {}),
+    n: judged.length, kept: kept.length, skipped: sources.filter((x) => x?.skipped).map((x) => x.url),
+    items: sortBy((b.all ? judged : kept).map(({ model, ...x }) => x), b.sort), ms: Date.now() - t0,
+    parallel: Math.max(1, Math.min(Number(b.parallel) || (urls.length > 1 ? LIST_PAR : 1), 8))
+  };
 }
 
 // ── one page, one set of yes/no questions, without touching the user's tab ─
@@ -617,6 +912,13 @@ async function choose(b) {
   const field = FIELD_ACTS.has(a.a);
   const pool = (r.items || []).filter((e) => !e.dis && (!field || e.field));
   if (pool.length < 2) return null;
+  // Every match is a link to the same page (a name, its photo and its
+  // caption): any of them does the job, and asking jev only cost ~400ms to
+  // come back "unsure 40%".
+  const to = (e) => String(e.href || '').split('#')[0];
+  if (!field && a.a === 'click' && pool.every((e) => e.href) && new Set(pool.map(to)).size === 1) {
+    return { i, a: a.a, of: pool.length, by: 'same', ref: pool[0].ref, confidence: 1, ms: Date.now() - t0 };
+  }
 
   const want = wantOf(a.target);
   // The candidates in the tightest box with the unsent text, the ones after
@@ -871,7 +1173,7 @@ async function eachUrl(urls, n, fn, o = {}) {
 // line per page as it finishes when the caller streams.
 async function manyReply(res, b, urls, fn) {
   const t0 = Date.now();
-  const pool = Math.max(1, Math.min(Number(b.parallel) || 6, 12));
+  const pool = Math.max(1, Math.min(Number(b.parallel) || 6, 16));
   const opts = { budget: Number(b.budget) || 0, perPage: Number(b.perPage) || 30000 };
   const end = (out) => ({ ok: true, n: urls.length, done: out.filter((x) => x && !x.skipped).length,
     skipped: out.filter((x) => x?.skipped).map((x) => x.url), ms: Date.now() - t0, parallel: pool });
@@ -896,6 +1198,8 @@ class HttpError extends Error {
 }
 
 async function runBatch(b) {
+  // A caller of the HTTP API may name the browser in the body instead.
+  if (b && b.browser && scope.getStore()?.browser !== b.browser) return scope.run({ browser: b.browser }, () => runBatch(b));
   let actions = Array.isArray(b) ? b : Array.isArray(b.actions) ? b.actions : b.a ? [b] : null;
 
   // A recipe is just a stored batch with the values left out. Expanding it
@@ -936,7 +1240,7 @@ async function runBatch(b) {
   spill(out, b.inline === true);
   if (b.memory !== false) { try { await unsent(actions, out); } catch {} }
   const ok = out.results.every((r) => r.ok);
-  note('do', { n: actions.length, ms: Date.now() - t0, ok });
+  note('do', { n: actions.length, ms: Date.now() - t0, ok, a: actions.map((x) => x.a).join(',').slice(0, 60) });
 
   // Learning is free — the bridge already has the actions and the outcomes.
   // Recall is deliberate: the digest rides back on arrival at a host and on
@@ -949,10 +1253,12 @@ async function runBatch(b) {
       // Arriving means either the batch navigated here, or this session was
       // last working somewhere else — an agent that walks up to a tab
       // already sitting on a site needs the briefing just as much.
+      // bx's own background reads are about other sites; they must not move
+      // "the site we are on", or the next bx note lands on the wrong host.
       const arrived = info.navigated || info.host !== lastHost;
-      lastHost = info.host;
+      if (b.memory !== false) lastHost = info.host;
       if (recipe) mem.ran(recipe.host, recipe.name, ok, Date.now() - t0);
-      if (b.memory !== false && (arrived || !ok)) memory = mem.digest(info.host);
+      if (b.memory !== false && (arrived || !ok)) memory = mem.digest(info.host, out.url);
       if (info.saved) out.learned = info.saved;
     }
   } catch (e) { note('err', { error: 'memory: ' + String(e.message || e) }); }
@@ -1098,15 +1404,41 @@ function browserName(m) {
 const refused = new Map();      // extension id -> {at, ua, tries}
 
 function extView(me) {
-  const p = primary();
+  let p;
+  try { p = destination('auto'); } catch { p = primary(); }
   return {
     allowed: CFG.extension_ids,
     refused: [...refused.entries()].map(([id, r]) => ({ id, at: r.at, tries: r.tries, browser: browserName({ ua: r.ua }) })),
-    browsers: [...exts.entries()].map(([ws, x]) => ({
-      iid: x.iid ? x.iid.slice(0, 8) : null, browser: browserName(x), ext: x.ext, primary: ws === p, you: ws === me,
+    // `primary`: where commands go now. `chosen`: picked with bx use / the popup
+    // rather than just being the one last in use.
+    chosen: CFG.browser ? CFG.browser.slice(0, 8) : null,
+    browsers: browsers().map(({ ws, m: x, label }, i) => ({
+      n: i + 1, iid: x.iid ? x.iid.slice(0, 8) : null, browser: browserName(x), label, ext: x.ext, primary: ws === p, you: ws === me,
+      chosen: !!CFG.browser && x.iid === CFG.browser,
       since: x.since, windows: x.windows, tabs: x.tabs
     }))
   };
+}
+
+// `bx use <browser>` and the popup's picker. null / auto: the one last in use.
+function browserUse(spec) {
+  if (spec === null || spec === undefined || spec === '' || spec === 'auto') { CFG.browser = null; saveConfig(CFG); return { ok: true, ...extView(), chosen: null }; }
+  const hit = findBrowser(spec);
+  if (!hit || !hit.m.iid) throw new HttpError(404, `no connected browser matches "${spec}" — bx browsers lists them`);
+  CFG.browser = hit.m.iid;
+  saveConfig(CFG);
+  return { ok: true, ...extView(), chosen: { iid: hit.m.iid.slice(0, 8), browser: hit.name, label: hit.label } };
+}
+
+// A name for a profile, since two Chrome profiles are otherwise told apart
+// only by an id.
+function browserLabel(spec, label) {
+  const hit = findBrowser(spec);
+  if (!hit || !hit.m.iid) throw new HttpError(404, `no connected browser matches "${spec}" — bx browsers lists them`);
+  const l = String(label || '').trim().slice(0, 24);
+  if (l) CFG.browser_names[hit.m.iid] = l; else delete CFG.browser_names[hit.m.iid];
+  saveConfig(CFG);
+  return { ok: true, ...extView() };
 }
 
 function extAllow(id) {
@@ -1125,7 +1457,12 @@ function extForget(id) {
   return { ok: true, allowed: CFG.extension_ids };
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  const want = req.headers['x-bx-browser'] || new URL(req.url, 'http://127.0.0.1').searchParams.get('browser') || undefined;
+  scope.run({ browser: want }, () => handle(req, res));
+});
+
+async function handle(req, res) {
   const url = new URL(req.url, 'http://127.0.0.1');
   const route = url.pathname;
 
@@ -1141,7 +1478,8 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (route === '/status' && req.method === 'GET') {
-      const p = primary();
+      let p;
+      try { p = destination(); } catch { p = primary(); }
       const m = p ? exts.get(p) : null;
       return send(res, 200, {
         ok: true,
@@ -1149,11 +1487,12 @@ const server = http.createServer(async (req, res) => {
         extension: { id: CFG.extension_ids[0] || null, ids: CFG.extension_ids, since: m ? m.since : 0, ua: m ? m.ua : null },
         refused: extView().refused,
         // Every browser and profile with bx loaded, the one commands go to first.
-        instances: [...exts.entries()].map(([ws, x]) => ({
-          iid: x.iid ? x.iid.slice(0, 8) : null, browser: browserName(x), primary: ws === p, since: x.since,
+        instances: browsers().map(({ ws, m: x, label }, i) => ({
+          n: i + 1, iid: x.iid ? x.iid.slice(0, 8) : null, browser: browserName(x), label, primary: ws === p, since: x.since,
           windows: x.windows, tabs: x.tabs, used: x.used || null, focusedAt: x.focusedAt || null,
           own: x.own, bxWindow: x.bxWindow
         })),
+        chosen: CFG.browser ? { iid: CFG.browser.slice(0, 8), label: CFG.browser_names[CFG.browser] || null, connected: !!findBrowser(CFG.browser) } : null,
         port: CFG.port,
         speed: CFG.speed,
         trusted: CFG.trusted,
@@ -1191,17 +1530,24 @@ const server = http.createServer(async (req, res) => {
     // ── memory ───────────────────────────────────────────────────────────
     if (route === '/memory' && req.method === 'GET') {
       if (url.searchParams.get('all') !== null) return send(res, 200, { ok: true, hosts: mem.hosts() });
+      if (url.searchParams.get('find') !== null) return send(res, 200, { ok: true, hits: mem.find(url.searchParams.get('find')) });
       const host = url.searchParams.get('host') || (await hostNow());
       if (!host) return send(res, 200, { ok: true, host: null, error: 'no site in view — pass a host' });
       const m = mem.full(host);
-      return send(res, 200, { ok: true, host, memory: m || null, digest: m ? mem.digest(host) : null });
+      return send(res, 200, { ok: true, host, memory: m || null, digest: m ? mem.digest(host, url.searchParams.get('host') ? null : (await placeNow()).url) : null });
+    }
+
+    if (route === '/memory/prune' && req.method === 'POST') {
+      const b = await body(req);
+      return send(res, 200, { ok: true, dry: !!b.dry, pruned: mem.prune(!!b.dry) });
     }
 
     if (route === '/memory/note' && req.method === 'POST') {
       const b = await body(req);
-      const host = b.host || (await hostNow());
+      const place = b.host ? { host: b.host } : await placeNow();
+      const host = place.host || lastHost;
       if (!host) return send(res, 400, { ok: false, error: 'no site in view — pass a host' });
-      const r = mem.note(host, b.text);
+      const r = mem.note(host, b.text, place.url);
       if (r && r.error) return send(res, 400, { ok: false, error: r.error });
       return send(res, r ? 200 : 400, r ? { ok: true, ...r } : { ok: false, error: 'empty note' });
     }
@@ -1253,6 +1599,9 @@ const server = http.createServer(async (req, res) => {
 
     // ── extensions: which may connect, which are ────────────────────────
     if (route === '/ext' && req.method === 'GET') return send(res, 200, { ok: true, ...extView() });
+    if (route === '/browsers' && req.method === 'GET') return send(res, 200, { ok: true, ...extView() });
+    if (route === '/browsers/use' && req.method === 'POST') return send(res, 200, browserUse((await body(req)).browser));
+    if (route === '/browsers/name' && req.method === 'POST') { const b = await body(req); return send(res, 200, browserLabel(b.browser, b.label)); }
     if (route === '/ext/allow' && req.method === 'POST') return send(res, 200, extAllow((await body(req)).id));
     if (route === '/ext/forget' && req.method === 'POST') return send(res, 200, extForget((await body(req)).id));
 
@@ -1311,8 +1660,12 @@ const server = http.createServer(async (req, res) => {
     // turn per page — the slowest way through a result set there is.
     if (route === '/items' && req.method === 'POST') {
       const b = await body(req);
+      const urls = [...new Set((b.urls || []).map(String).filter((u) => /^https?:\/\//i.test(u)))];
+      if (urls.length) return send(res, 200, await siftMany({ ...b, criterion: undefined }, urls));
       const pages = await collect(b);
-      return send(res, 200, { ok: true, pages: pages.length, n: pages.reduce((n, p) => n + p.items.length, 0), results: pages });
+      const n = pages.reduce((k, p) => k + p.items.length, 0);
+      if (b.sort) return send(res, 200, { ok: true, pages: pages.length, n, sorted: b.sort, items: sortBy(pages.flatMap((p) => p.items), b.sort) });
+      return send(res, 200, { ok: true, pages: pages.length, n, results: pages });
     }
 
     // "Go through this list and keep the good ones." The step a research task
@@ -1323,6 +1676,8 @@ const server = http.createServer(async (req, res) => {
     if (route === '/jev/sift' && req.method === 'POST') {
       const b = await body(req);
       if (!b.criterion) throw new HttpError(400, 'sift needs a criterion — what makes an item worth keeping');
+      const urls = [...new Set((b.urls || []).map(String).filter((u) => /^https?:\/\//i.test(u)))];
+      if (urls.length) return send(res, 200, await siftMany(b, urls));
       const t0 = Date.now();
       const judging = [];
       const pages = await collect(b, (page) => { judging.push(judge(b, page)); });
@@ -1339,7 +1694,7 @@ const server = http.createServer(async (req, res) => {
         ok: true, criterion: b.criterion, pages: pages.length || 1, ...(unjudged.length ? { unjudged: `${unjudged.length} items: ${unjudged[0].unjudged}` } : {}),
         url: pages[0]?.url || b.url, title: pages[0]?.title || b.title,
         n: judged.length, kept: kept.length,
-        items: (b.all ? judged : kept).map(({ model, ...x }) => x), ms: Date.now() - t0, model: judged.find((x) => x.model)?.model, saw: judged.some((x) => x.saw)
+        items: sortBy((b.all ? judged : kept).map(({ model, ...x }) => x), b.sort), ms: Date.now() - t0, model: judged.find((x) => x.model)?.model, saw: judged.some((x) => x.saw)
       });
     }
 
@@ -1409,19 +1764,23 @@ const server = http.createServer(async (req, res) => {
     note('err', { error: String(e.message || e) });
     return send(res, e.code || 500, { ok: false, error: String(e.message || e) });
   }
-});
+}
 
 // Which site are we talking about? The last batch usually answers it without a
 // round trip; otherwise ask the live tab.
+// The live tab first: `bx agent` runs with memory off, so after one the last
+// batch's host is the site the agent left, not the one it is on.
 async function hostNow() {
-  if (lastHost) return lastHost;
-  if (!connected()) return null;
+  return (await placeNow()).host || lastHost;
+}
+async function placeNow() {
+  if (!connected()) return {};
   try {
     const out = await call({ t: 'run', tab: 'active', actions: [{ a: 'info' }], timeout: 3000, stopOnError: true, speed: 'instant', trusted: false }, 6000);
     const h = mem.hostOf(out && out.url);
     if (h) lastHost = h;
-    return h;
-  } catch { return null; }
+    return { host: h, url: out && out.url };
+  } catch { return {}; }
 }
 
 function pick(c) {
@@ -1507,6 +1866,7 @@ async function request(ws, m) {
       if ('enabled' in a) patch.enabled = !!a.enabled;
       r = { ok: true, jev: jevPatch(patch) };
     }
+    else if (m.op === 'browser.use') r = browserUse(a.browser);
     else if (m.op === 'jev.add') r = await keyAdd({ key: a.key, label: a.label, provider: a.provider });
     else if (m.op === 'jev.rm') r = keyRemove(a.id);
     else r = { ok: false, error: `unknown request ${m.op}` };

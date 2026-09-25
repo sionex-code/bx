@@ -19,7 +19,35 @@ async function render() {
   $('show').hidden = !(own && w);
   if (w) $('show').textContent = `Show bx window · ${w.tabs} tab${w.tabs === 1 ? '' : 's'}`;
   $('min').hidden = !(own && w && w.state === 'minimized');
-  if (s && s.connected) renderJev(await jev('jev'));
+  if (s && s.connected) { const r = await jev('jev'); renderJev(r); renderBrowsers(r); }
+}
+
+// ── browsers ─────────────────────────────────────────────────────────────
+const plural = (n, w) => `${n ?? '?'} ${w}${n === 1 ? '' : 's'}`;
+// With bx in several browsers (or profiles), pick which one agents drive.
+// Auto: the one used most recently.
+function renderBrowsers(r) {
+  const bs = (r && r.ok && r.ext && r.ext.browsers) || [];
+  $('browsers').hidden = bs.length < 2;
+  if (bs.length < 2) return;
+  $('bcount').textContent = `${bs.length} connected`;
+  const chosen = r.ext.chosen;
+  const row = (value, title, sub, checked, here) => {
+    const input = el('input', { type: 'radio', name: 'browser', value, checked });
+    input.addEventListener('change', async () => {
+      const x = await jev('browser.use', { browser: value });
+      if (!x.ok) return say(x.error, true);
+      renderBrowsers(await jev('jev'));
+    });
+    return el('li', {}, el('label', { className: 'pick' }, input,
+      el('div', { className: 'k' }, el('b', { textContent: title }), el('span', { textContent: sub }))),
+      here ? el('span', { className: 'here', textContent: 'active' }) : null);
+  };
+  const auto = bs.find((b) => b.primary);
+  $('blist').replaceChildren(
+    row('auto', 'Auto', `the one last in use${!chosen && auto ? ` · now ${auto.browser}` : ''}`, !chosen, false),
+    ...bs.map((b) => row(b.iid, `${b.browser || 'Browser'}${b.label ? ` “${b.label}”` : ''}${b.you ? ' (this one)' : ''}`,
+      `${plural(b.windows, 'window')} · ${plural(b.tabs, 'tab')} · ${b.iid}`, b.chosen, b.primary)));
 }
 
 // ── jev ──────────────────────────────────────────────────────────────────

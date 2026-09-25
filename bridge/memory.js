@@ -339,6 +339,11 @@ function learn(batch) {
 
   let saved = null;
   for (const seg of segs) {
+    // bx's own reads — a background tab opened for `bx read <urls>`, a check,
+    // a sift — teach nothing about a site and used to leave a memory file
+    // behind for every host they touched. Only an internal batch that acted
+    // (bx each --do) is worth learning from.
+    if (batch.internal && !seg.items.some((x) => WORTH.has(x.a.a))) continue;
     const m = load(seg.host, true);
     if (!m) continue;
     m.runs = (m.runs || 0) + 1;
@@ -370,6 +375,9 @@ function learn(batch) {
         if (literal && !literal.startsWith('ref=')) failed.set(a.a, literal);
       }
       if (r.ok && r.r && r.r.covered) trap(m, `${a.a} ${durable || literal} lands on an overlay — dismiss it first`);
+      // A stale ref or a mistyped selector is the caller's slip, not something
+      // about the site: kept as traps they pushed the real ones out.
+      if (!r.ok && (literal.startsWith('ref=') || /bad selector|not a valid selector|invalid selector|SyntaxError/i.test(String(r.error)))) continue;
       if (!r.ok && /not found/.test(String(r.error))) trap(m, `${literal} is not on this page (${a.a})`);
       else if (!r.ok && r.error) trap(m, `${a.a} ${literal}: ${String(r.error).slice(0, 100)}`);
     }
@@ -504,7 +512,7 @@ function full(host) {
 
 // The compact form that rides back on a /do response. Hard caps everywhere —
 // this lands in an agent's context on every arrival, so it has to stay small.
-function digest(host) {
+function digest(host, url) {
   const m = full(host);
   if (!m) return null;
   const out = { host: m.host };
@@ -538,7 +546,13 @@ function digest(host) {
     `${path}?` + Object.entries(ps).map(([k, x]) => `${k}=${encodeURIComponent(x.v)} (${x.via})`).join(' &'));
   if (urls.length) out.urls = urls;
 
-  const notes = m.notes.slice(-4).map((n) => n.t.slice(0, 200));
+  // Notes about this kind of page first (a note written on /groups/123 is
+  // about every /groups/:id), then the newest of the rest. Showing only the
+  // last four hid older notes that still mattered.
+  const here = url ? shapeOf(url) : null;
+  const local = here ? m.notes.filter((n) => n.path && n.path === here) : [];
+  const notes = [...local.slice(-4).reverse(), ...m.notes.filter((n) => !local.includes(n)).reverse()]
+    .slice(0, 6).map((n) => n.t.slice(0, 200));
   if (notes.length) out.notes = notes;
 
   const traps = m.traps.filter((t) => (t.n || 1) >= 2).sort((a, b) => b.n - a.n).slice(0, 4).map((t) => `${t.t} (×${t.n})`);
@@ -555,7 +569,7 @@ function digest(host) {
 // ── writes the agent asks for ────────────────────────────────────────────
 const NOTE_MAX = 160;
 
-function note(host, text) {
+function note(host, text, url) {
   const m = load(host, true);
   if (!m) return null;
   const t = String(text).replace(/\s+/g, ' ').trim();
@@ -566,7 +580,7 @@ function note(host, text) {
   const norm = t.toLowerCase();
   const i = m.notes.findIndex((n) => n.t.toLowerCase() === norm);
   if (i >= 0) m.notes.splice(i, 1);
-  m.notes.push({ t, at: Date.now() });
+  m.notes.push({ t, at: Date.now(), ...(url && hostOf(url) ? { path: shapeOf(url) } : {}) });
   if (m.notes.length > CAP.notes) m.notes.splice(0, m.notes.length - CAP.notes);
   touch(m);
   return { host: m.host, notes: m.notes.length };
@@ -658,6 +672,51 @@ function ran(host, name, ok, ms) {
   touch(m);
 }
 
+// ── looking across every site ────────────────────────────────────────────
+// "You may have a blueprint saved somewhere": the answer is usually a note or
+// a recipe on some host, and nobody remembers which. Every word must appear.
+function find(query) {
+  const words = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return [];
+  const hit = (t) => { const l = String(t || '').toLowerCase(); return words.every((w) => l.includes(w)); };
+  const out = [];
+  let files = [];
+  try { files = fs.readdirSync(DIR).filter((f) => f.endsWith('.json')); } catch {}
+  for (const f of files) {
+    const host = f.replace(/\.json$/, '');
+    const m = cache.get(host) || (() => { try { return JSON.parse(fs.readFileSync(path.join(DIR, f), 'utf8')); } catch { return null; } })();
+    if (!m) continue;
+    for (const n of m.notes || []) if (hit(`${m.host} ${n.t}`)) out.push({ host: m.host, kind: 'note', text: n.t, at: n.at });
+    for (const [name, r] of Object.entries(m.recipes || {})) {
+      const flow = sigOf(r.steps || []);
+      if (hit(`${m.host} ${name} ${flow} ${r.note || ''}`)) out.push({ host: m.host, kind: 'recipe', name, text: flow.slice(0, 200), at: r.at });
+    }
+    for (const [p, ps] of Object.entries(m.urls || {})) {
+      const line = `${p}?` + Object.entries(ps).map(([k, x]) => `${k}=${x.v} (${x.via})`).join(' &');
+      if (hit(`${m.host} ${line}`)) out.push({ host: m.host, kind: 'url', text: line, at: Math.max(...Object.values(ps).map((x) => x.at || 0)) });
+    }
+  }
+  return out.sort((a, b) => (b.at || 0) - (a.at || 0)).slice(0, 30);
+}
+
+// Hosts bx only ever read, never learned anything from: no note, recipe,
+// URL lesson or flow. Background reads used to leave one of these per site.
+function prune(dry) {
+  flush();
+  const gone = [];
+  let files = [];
+  try { files = fs.readdirSync(DIR).filter((f) => f.endsWith('.json')); } catch {}
+  for (const f of files) {
+    let m;
+    try { m = JSON.parse(fs.readFileSync(path.join(DIR, f), 'utf8')); } catch { continue; }
+    const empty = !(m.notes || []).length && !Object.keys(m.recipes || {}).length && !Object.keys(m.urls || {}).length && !(m.traces || []).length;
+    if (!empty || (m.runs || 0) >= 20) continue;
+    gone.push(m.host || f.replace(/\.json$/, ''));
+    if (!dry) { cache.delete(m.host); try { fs.unlinkSync(path.join(DIR, f)); } catch {} }
+  }
+  return gone;
+}
+
 function forget(host, what, name) {
   const h = resolveHost(host);
   if (!h) return { error: `nothing known about ${host}` };
@@ -678,4 +737,4 @@ function forget(host, what, name) {
   return { forgot: what, host: h, name };
 }
 
-module.exports = { hostOf, pathOf, learn, digest, full, hosts, note, promote, expand, ran, forget, sigOf, brief, flush };
+module.exports = { hostOf, pathOf, learn, digest, full, hosts, note, promote, expand, ran, forget, find, prune, sigOf, brief, flush };

@@ -210,7 +210,15 @@ async function groupIn(win, tabIds, group) {
 let making = null;
 async function ownWindow() {
   const p = await place();
-  if (p.win !== undefined && await chrome.windows.get(p.win).catch(() => null)) return p;
+  const w = p.win !== undefined ? await chrome.windows.get(p.win).catch(() => null) : null;
+  if (w) {
+    // Chrome pauses every page in a minimized window: feeds stop loading
+    // when scrolled, timers stall. After a reboot bx's window came back
+    // minimized and every list stopped at its first screen. Restore it,
+    // without focus, so it sits behind whatever the user is doing.
+    if (w.state === 'minimized') await chrome.windows.update(w.id, { state: 'normal', focused: false }).catch(() => {});
+    return p;
+  }
   if (!making) {
     making = (async () => {
       // Lost track of it, not lost it: a window holding a "bx" group is bx's.
@@ -719,11 +727,13 @@ W.closetab = async (tabId, a) => {
 
 // The toolbar popup asks whether the bridge is reachable and where bx works.
 chrome.runtime.onMessage.addListener((m, sender, respond) => {
+  // A hidden page's own timers run at 1Hz; the worker keeps time for it.
+  if (m && m.t === 'bx-sleep') { setTimeout(() => respond(true), Math.max(0, Math.min(Number(m.ms) || 0, 30000))); return true; }
   // Keys and settings: from the popup page only. Content scripts run inside
   // every website and can message this worker too, so they are refused here.
   if (m && m.t === 'jev') {
     const fromPopup = sender.id === chrome.runtime.id && String(sender.url || '').startsWith(chrome.runtime.getURL('popup.html'));
-    if (!fromPopup || !['jev', 'jev.set', 'jev.add', 'jev.rm'].includes(m.op)) return;
+    if (!fromPopup || !['jev', 'jev.set', 'jev.add', 'jev.rm', 'browser.use'].includes(m.op)) return;
     bridge(m.op, m.args || {}).then(respond);
     return true;
   }
@@ -834,6 +844,11 @@ async function exec(tabId, a, cfg, batch) {
     // races widgets that re-render as you type — Wikipedia's search box
     // submitted "Ala" for "Alan Turing" — and one insert cannot be raced.
     await toContent(tabId, { a: 'click', target: a.target, in: a.in, speed: 'instant' }, cfg);
+    // Selected in the page first. Ctrl+A alone did not reach a field in bx's
+    // unfocused window, so the insert went in front of the old text: the agent
+    // typed "Alan Turing" into a box holding "go language google" three times
+    // over, and searched for none of them.
+    if (a.clear !== false) await toContent(tabId, { a: 'selectall', target: a.target, in: a.in }, cfg).catch(() => {});
     const r = await withCdp(tabId, async (t) => {
       if (a.clear !== false) {
         await cdp(t, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2, commands: ['selectAll'] });
@@ -878,7 +893,10 @@ async function runBatch(m) {
     // Typing is paced per character, so a long string legitimately outruns the
     // element-wait budget — a 1500-character prompt used to die on "type timed
     // out" after doing most of the work. Give the keystrokes their own room.
-    const budget = (a.timeout ?? m.timeout ?? CFG.timeout) + 4000 + typingMs(a, cfg.speed);
+    // A nav's own load wait is soft and 15s by default (see waitForLoad); the
+    // hard limit sat at 12s under it and failed slow pages that had loaded.
+    const own = a.timeout ?? (a.a === 'nav' ? 15000 : m.timeout ?? CFG.timeout);
+    const budget = own + 4000 + typingMs(a, cfg.speed);
     try {
       const r = await withTimeout(exec(tabId, { speed: cfg.speed, ...a }, cfg, m), budget, a.a);
       // let newtab/tab hand the rest of the batch its new tab

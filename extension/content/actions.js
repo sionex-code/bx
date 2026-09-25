@@ -100,6 +100,32 @@ A.type = async (a) => {
 
 A.setval = async (a) => { const el = await BX.want(a.target, opt(a)); BX.setValue(el, a.value); return hit(el); };
 A.clear  = async (a) => { const el = await BX.want(a.target, opt(a)); BX.clearField(el); return hit(el); };
+// Focus the field and select what it holds, firing nothing: the one trusted
+// insert that follows replaces the selection. Clearing first fired input
+// events, and widgets that re-render on input (Wikipedia's search box) swapped
+// the field out from under the insert.
+A.selectall = async (a) => {
+  const el = await BX.want(a.target, opt(a));
+  el.focus({ preventScroll: true });
+  if (el.isContentEditable) { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+  else { try { el.select(); } catch { try { el.setSelectionRange(0, String(el.value || '').length); } catch {} } }
+  return hit(el);
+};
+// Submit the form a field belongs to, the way pressing Enter would have:
+// requestSubmit runs the page's own submit handlers and validation. For when
+// Enter was swallowed — Wikipedia's search widget takes a trusted Enter for
+// its suggestion menu and the search never runs. No form: click the nearest
+// submit-looking button after the field.
+A.submit = async (a) => {
+  const el = await BX.want(a.target, opt(a));
+  const f = el.form || el.closest('form');
+  if (f) {
+    const btn = f.querySelector('button[type=submit], input[type=submit], button:not([type])');
+    if (typeof f.requestSubmit === 'function') f.requestSubmit(btn && f.contains(btn) ? btn : undefined); else f.submit();
+    return { ...hit(el), via: 'form' };
+  }
+  return { ...hit(el), via: 'none' };
+};
 A.focus  = async (a) => { const el = await BX.want(a.target, opt(a)); await BX.ensureVisible(el); el.focus({ preventScroll: true }); return hit(el); };
 A.press  = async (a) => {
   const el = a.target ? await BX.want(a.target, opt(a)) : document.activeElement;
@@ -591,7 +617,8 @@ A.matches = async (a) => {
     url: location.href, title: document.title, n: pool.length,
     items: pool.slice(0, a.max || 12).map((el) => ({
       ...BX.describe(el), where: BX.region(el), sec: BX.section(el),
-      field: isBox(el) || undefined, ctx: around(el) || undefined, near: near(el)
+      field: isBox(el) || undefined, ctx: around(el) || undefined, near: near(el),
+      href: el.closest('a[href]')?.href || undefined
     })),
     drafts: drafts.map((d) => ({ label: d.label, text: d.text.slice(0, 160) }))
   };
@@ -634,16 +661,23 @@ A.wait = async (a) => {
       // that keeps animating forever is still worth reading, so on the deadline
       // it just reports that it did not settle.
       if (document.readyState === 'complete') {
+        // The observer only notes when the page last changed; the loop sleeps
+        // until that is `quiet` ms ago. Re-arming a timer on every mutation
+        // was hundreds of timers a second, and each one a round trip to the
+        // worker when the page is hidden (see BX.sleep).
         const quiet = a.quiet ?? 300;
-        const settled = await new Promise((res) => {
-          let t;
-          const mo = new MutationObserver(() => { clearTimeout(t); t = setTimeout(done, quiet); });
-          const stop = setTimeout(() => { mo.disconnect(); clearTimeout(t); res(false); }, Math.max(0, deadline - Date.now()));
-          function done() { mo.disconnect(); clearTimeout(stop); res(true); }
-          mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-          t = setTimeout(done, quiet);
-        });
-        return { waited: Date.now() - t0, settled };
+        let last = performance.now();
+        const mo = new MutationObserver(() => { last = performance.now(); });
+        mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+        try {
+          for (;;) {
+            const since = performance.now() - last;
+            if (since >= quiet) return { waited: Date.now() - t0, settled: true };
+            const left = deadline - Date.now();
+            if (left <= 0) return { waited: Date.now() - t0, settled: false };
+            await BX.sleep(Math.min(quiet - since + 5, left));
+          }
+        } finally { mo.disconnect(); }
       }
       if (Date.now() >= deadline) return { waited: Date.now() - t0, settled: false };
     }
