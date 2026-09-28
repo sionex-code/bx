@@ -79,6 +79,27 @@ A.drag = async (a) => {
   return { from: [Math.round(p0.x), Math.round(p0.y)], to: [Math.round(p1.x), Math.round(p1.y)] };
 };
 
+// ── press and hold ─────────────────────────────────────────────────────────
+// For press-and-hold human-verification buttons (e.g. PerimeterX "PRESS & HOLD").
+// Moves to the target like a human, presses down, waits `ms`, then releases.
+A.hold = async (a) => {
+  const el = await BX.want(a.target, opt(a));
+  await BX.ensureVisible(el);
+  const p = BX.pointIn(el);
+  await BX.moveTo(p.x, p.y, a.speed);
+  const ms = Math.min(Math.max(Number(a.ms) || 8000, 1000), 30000);
+  const down = BX.at(p.x, p.y) || el;
+  BX.mouse.down = true;
+  BX.fire(down, 'pointerdown', p.x, p.y, { buttons: 1 });
+  BX.fire(down, 'mousedown', p.x, p.y, { buttons: 1, detail: 1 });
+  await BX.sleep(ms);
+  const up = BX.at(p.x, p.y) || down;
+  BX.mouse.down = false;
+  BX.fire(up, 'pointerup', p.x, p.y, { buttons: 0 });
+  BX.fire(up, 'mouseup', p.x, p.y, { buttons: 0, detail: 1 });
+  return { ...hit(el), held_ms: ms, at: [Math.round(p.x), Math.round(p.y)] };
+};
+
 // ── input ────────────────────────────────────────────────────────────────
 const isBox = (el) => el && (el.isContentEditable || el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && /^(|text|search|email|url|tel)$/i.test(el.type || '')));
 
